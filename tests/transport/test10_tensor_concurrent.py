@@ -1,0 +1,116 @@
+"""Tensor phase / Test 5: four workers (A, B, C, D), two independent pairs
+(A<->B, C<->D) exchanging tensors simultaneously. Verifies no corruption, no
+deadlock, and no cross-talk between the two unrelated pairs.
+
+Run:
+    python3 test10_tensor_concurrent.py --transport tcp
+    python3 test10_tensor_concurrent.py --transport udp
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+import torch
+from _common import MP_CTX, SignalingServer, free_port, transport_config_pair
+
+from vllm.transport import TransportConfig, get_transport
+from vllm.transport.tensor import TransportProcessGroup
+
+N_ELEMENTS = 64 * 1024 // 4  # 64 KB, float32
+
+
+def _make_tensor(seed: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(N_ELEMENTS, generator=g, dtype=torch.float32)
+
+
+def _worker(result_queue, backend: str, config: TransportConfig, role: str, my_seed: int, peer_seed: int) -> None:
+    transport = get_transport(backend)
+    t0 = time.monotonic()
+    transport.connect(config)
+    connect_s = time.monotonic() - t0
+    pg = TransportProcessGroup(transport)
+
+    my_tensor = _make_tensor(my_seed)
+    expected_from_peer = _make_tensor(peer_seed)
+
+    if role == "initiator":
+        pg.send_tensor(my_tensor)
+        received, _stats = pg.recv_tensor(timeout=30)
+    else:
+        received, _stats = pg.recv_tensor(timeout=30)
+        pg.send_tensor(my_tensor)
+    transport.close()
+
+    result_queue.put({
+        "self_id": config.self_id,
+        "peer_id": config.peer_id,
+        "connect_s": connect_s,
+        "no_cross_talk": torch.equal(received, expected_from_peer),
+        "shape_ok": tuple(received.shape) == tuple(expected_from_peer.shape),
+    })
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=["tcp", "udp"], required=True)
+    args = parser.parse_args()
+
+    signaling = SignalingServer() if args.transport == "udp" else None
+    signaling_url = None
+    if signaling is not None:
+        signaling.start()
+        signaling_url = signaling.url
+
+    try:
+        port_ab = free_port()
+        port_cd = free_port() if args.transport == "tcp" else port_ab + 10
+        cfg_a, cfg_b = transport_config_pair(args.transport, "A", "B", signaling_url, port_ab)
+        cfg_c, cfg_d = transport_config_pair(args.transport, "C", "D", signaling_url, port_cd)
+        # Distinct seeds per worker so a cross-talk bug (receiving the wrong
+        # pair's tensor) would produce a shape/value mismatch, not an
+        # accidental match.
+        seeds = {"A": 1, "B": 2, "C": 3, "D": 4}
+
+        result_queue = MP_CTX.Queue()
+        procs = [
+            MP_CTX.Process(target=_worker, args=(result_queue, args.transport, cfg_a, "initiator", seeds["A"], seeds["B"])),
+            MP_CTX.Process(target=_worker, args=(result_queue, args.transport, cfg_b, "responder", seeds["B"], seeds["A"])),
+            MP_CTX.Process(target=_worker, args=(result_queue, args.transport, cfg_c, "initiator", seeds["C"], seeds["D"])),
+            MP_CTX.Process(target=_worker, args=(result_queue, args.transport, cfg_d, "responder", seeds["D"], seeds["C"])),
+        ]
+        t_start = time.monotonic()
+        for p in procs:  # all four launched together - this is the concurrency under test
+            p.start()
+
+        results = [result_queue.get(timeout=60) for _ in procs]
+        total_s = time.monotonic() - t_start
+        for p in procs:
+            p.join(timeout=15)
+
+        deadlocked = any(p.is_alive() for p in procs)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+    finally:
+        if signaling is not None:
+            signaling.stop()
+
+    print(f"=== Tensor Test 5: concurrent 4-worker tensor exchange ({args.transport}) ===")
+    print(f"  wall time for all 4 workers: {total_s:.2f} s   deadlock: {deadlocked}")
+    ok = not deadlocked
+    for r in sorted(results, key=lambda x: x["self_id"]):
+        print(
+            f"  {r['self_id']} <-> {r['peer_id']}: connect={r['connect_s']:.2f}s  "
+            f"no_cross_talk={r['no_cross_talk']}  shape_ok={r['shape_ok']}"
+        )
+        ok = ok and r["no_cross_talk"] and r["shape_ok"]
+
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
