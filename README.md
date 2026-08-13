@@ -36,20 +36,15 @@ udp_holepunch/          standalone UDP hole-punch library (signaling
                          client/server, NAT traversal, reliable delivery
                          on top of UDP) - no vLLM or torch dependency
 
-transport_runtime/       framework-agnostic communication runtime that
-                         wraps udp_holepunch/ (and a plain TCP backend)
-                         behind one Backend interface - no vLLM
-                         dependency either; see transport_runtime/README.md
-                         and docs/ARCHITECTURE_DECISION.md for why this
-                         layer was extracted out of the vLLM adapter
-
-vllm/transport/          the vLLM-specific adapter: consumes
-                         transport_runtime, replaces the pipeline-parallel
-                         dimension of vLLM's real GroupCoordinator with a
-                         transport-backed one right after local TP
-                         bootstrap (pp_worker.py, pipeline_bootstrap.py),
-                         plus a TransportExecutor for the driver rank
-                         (rpc_executor.py) - see vllm/transport/README.md
+vllm/transport/          the vLLM-specific adapter: imports udp_holepunch/
+                         (and implements a plain TCP backend) behind a
+                         small Transport interface, then replaces the
+                         pipeline-parallel dimension of vLLM's real
+                         GroupCoordinator with a transport-backed one
+                         right after local TP bootstrap (pp_worker.py,
+                         pipeline_bootstrap.py), plus a TransportExecutor
+                         for the driver rank (rpc_executor.py) - see
+                         vllm/transport/README.md
 
 humming_fix/             SM75 (Tesla T4) runtime bugfixes for the
                          humming-kernels MoE package this model needs,
@@ -69,13 +64,15 @@ pp_tests/                launch scripts for the current cluster
                          scripts written against real hardware
 ```
 
-Three-layer split (`udp_holepunch` -> `transport_runtime` -> `vllm/transport`)
-so the hole-punch transport and its generic runtime wrapper stay reusable
-outside vLLM entirely - `transport_runtime` has no vLLM or torch import in
-it. See `docs/ARCHITECTURE_DECISION.md` for the full reasoning (why extract
-at all, what was debated, what got reverted) and `transport_runtime/README.md`
-for what actually migrated vs. what's still vendored directly in
-`vllm/transport/`.
+Two-layer split (`udp_holepunch` -> `vllm/transport`), not three: an
+earlier design (`docs/ARCHITECTURE_DECISION.md`) planned a
+framework-agnostic `transport_runtime` package in between, generic enough
+to sit under other inference frameworks too - but that migration was
+never actually wired into the live code path (`vllm/transport/*.py`
+always imported `udp_holepunch/peer.py` directly and still does), so it's
+been removed from this repo rather than kept as misleading dead code. See
+`docs/ARCHITECTURE_DECISION.md`'s path note for the full history if
+reviving that extraction is ever worth it.
 
 ## Quick start
 

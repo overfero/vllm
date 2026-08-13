@@ -1,5 +1,0 @@
-{
-  "raw_short": {"prompt": "The capital of France is", "output": " Paris. Which of the following statements about Paris is true?\nA. It is located in the northern"},
-  "chat_2plus2": {"prompt": "What is 2+2?", "output": "2 + 2 equals 4."},
-  "raw_long_67tok": {"prompt_tokens": 67, "output": " Paris. The French language is one of the most"}
-}

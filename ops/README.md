@@ -53,7 +53,7 @@ torch/vllm/humming-kernels install and checkpoint extraction directly
 
 The entire repo (this checkout's root, i.e. everything `git ls-files`
 would show minus `__pycache__`/`.pytest_cache`) - the vllm package itself,
-`humming_fix/`, `transport_runtime/`, `udp_holepunch/`, `ops/`, `pp_tests/`,
+`humming_fix/`, `udp_holepunch/`, `ops/`, `pp_tests/`,
 `scripts/`, `_pysitecustomize/` all travel together in one `rsync`, landing
 at the same absolute path (`/kaggle/working/vllm` by default, override via
 `REMOTE_PROJECT_ROOT`) on the remote as this checkout occupies locally -

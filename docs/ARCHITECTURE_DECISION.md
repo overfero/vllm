@@ -10,10 +10,20 @@ framework-agnostic runtime.
 
 **Path note**: paths below (e.g. `/kaggle/working/transport_runtime/`)
 reflect this repo's layout *at the time this decision was made*, before
-`udp_holepunch/`, `transport_runtime/`, `humming_fix/`, `ops/`, `pp_tests/`
-were consolidated as subdirectories of this checkout. The conclusion (the
-3-layer split) is unaffected; see the top-level `README.md` for the
+`udp_holepunch/`, `humming_fix/`, `ops/`, `pp_tests/` were consolidated as
+subdirectories of this checkout. See the top-level `README.md` for the
 current layout.
+
+**Outcome note (later)**: the 3-layer split this document recommends
+(`udp_holepunch` -> `transport_runtime` -> `vllm/transport`) was
+implemented as a standalone package, but the migration described in Part
+7 Phase 3 below (`pipeline_bootstrap.py`/`parallel_state.py` switching to
+consume it) never actually landed in the live code - `vllm/transport/*.py`
+kept importing `udp_holepunch/peer.py` directly the whole time. Verified
+by grep at the time `transport_runtime/` was removed from this repo: no
+file outside the package itself (aside from one file under
+`pp_tests/archive/`) ever imported it. Kept as design history, not as an
+accurate account of what's currently wired in.
 
 This document was produced by (1) direct inspection of this repository —
 file contents, `git` history, line counts, and every integration point

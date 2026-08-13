@@ -36,7 +36,6 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "transport_runtime"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vllm"))
 
 import cloudpickle
@@ -94,7 +93,6 @@ def _stage_server_side(result_queue) -> None:
 
 
 def _driver_side(result_queue) -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "transport_runtime"))
     from vllm.transport import TransportConfig, get_transport
 
     time.sleep(1.0)  # let stage_server bind/listen first

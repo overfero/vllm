@@ -14,6 +14,12 @@ Both fixes are runtime monkeypatches, applied on `import humming_fix.patch`.
 Usage: `import humming_fix.patch` before anything constructs a
 `HummingKernel`/loads a Humming-quantized model.
 
+Note: `sm75_mma_probe/`, cited below as the empirical evidence for Fix 2,
+was a one-off diagnostic (raw PTX compiled directly with nvcc, no runtime
+dependency on it) and has since been removed from this repo as unused
+dead weight, archived separately outside version control. The citations
+below describe work already done, not a live dependency.
+
 
 ===========================================================================
 Fix 1 - num_write_splits vs. block/warp shape mismatch (MoE and dense)

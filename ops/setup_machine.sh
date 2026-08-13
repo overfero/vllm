@@ -149,7 +149,7 @@ rssh() {
 # ---- stages ----
 
 stage_code() {
-  log "syncing repo (vllm package incl. .git, humming_fix, transport_runtime, udp_holepunch, ops, pp_tests, scripts)..."
+  log "syncing repo (vllm package incl. .git, humming_fix, udp_holepunch, ops, pp_tests, scripts)..."
   sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -p "$PORT" root@127.0.0.1 \
     "mkdir -p $REMOTE_PROJECT_ROOT"
   sshpass -p "$PASSWORD" rsync -az -e "ssh -o StrictHostKeyChecking=no -p $PORT" \

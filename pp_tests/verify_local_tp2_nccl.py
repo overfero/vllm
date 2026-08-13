@@ -1,7 +1,7 @@
 """Real NCCL sanity check across this machine's 2 local T4s - proves the
 TP=2 half of the TP=2/PP=3 target topology works on real hardware
-(separate from the PP-across-machines half, which uses transport_runtime
-instead of NCCL and is proven elsewhere).
+(separate from the PP-across-machines half, which uses vllm/transport's
+UDP hole-punch transport instead of NCCL and is proven elsewhere).
 """
 import os
 import torch
