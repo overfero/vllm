@@ -1,0 +1,12 @@
+# Config for ops/setup_all.sh - copy to machines.conf and fill in current
+# credentials (these expire/rotate whenever a machine's session resets -
+# get fresh port+password each time; never commit the real machines.conf).
+#
+# Format: NAME PORT PASSWORD [EXTRA_SETUP_MACHINE_ARGS...]
+#
+# Machine A (this local sandbox) is not listed here - it's the
+# orchestrator itself, set up directly (see ops/README.md).
+
+# machineB 9194 REPLACE_ME --extract-stage 12:24:/data/stage1-checkpoint
+# machineC 9195 REPLACE_ME --extract-stage 24:36:/data/stage2-checkpoint
+# machineD 9193 REPLACE_ME --extract-stage 36:48:/data/stage3-checkpoint:globals

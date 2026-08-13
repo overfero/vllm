@@ -20,7 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # make `vllm` impo
 
 from vllm.transport import TransportConfig  # noqa: E402
 
-EXISTING_TRANSPORT_DIR = Path(os.environ.get("VLLM_UDP_TRANSPORT_DIR", "/kaggle/working/udp_holepunch"))
+EXISTING_TRANSPORT_DIR = Path(
+    os.environ.get("VLLM_UDP_TRANSPORT_DIR", str(Path(__file__).resolve().parents[2] / "udp_holepunch"))
+)
 MP_CTX = mp.get_context("fork")
 
 

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vLLM UDP-PP Chat</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #log { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+  .msg { padding: 0.6rem 0.9rem; border-radius: 0.6rem; white-space: pre-wrap; line-height: 1.4; }
+  .user { background: #2563eb22; align-self: flex-end; }
+  .assistant { background: #80808022; align-self: flex-start; }
+  form { display: flex; gap: 0.5rem; }
+  textarea { flex: 1; resize: vertical; min-height: 2.5rem; font: inherit; padding: 0.5rem; }
+  button { padding: 0.5rem 1rem; }
+  #status { font-size: 0.85rem; opacity: 0.7; margin-bottom: 0.5rem; }
+</style>
+</head>
+<body>
+<h3>vLLM UDP hole-punch pipeline-parallel cluster</h3>
+<div id="status">idle</div>
+<div id="log"></div>
+<form id="form">
+  <textarea id="input" placeholder="Ask something..." autofocus></textarea>
+  <button type="submit">Send</button>
+</form>
+<script>
+const log = document.getElementById('log');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const status = document.getElementById('status');
+const history = [];
+
+function addMessage(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  log.appendChild(div);
+  div.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  return div;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  history.push({ role: 'user', content: text });
+  addMessage('user', text);
+  const assistantDiv = addMessage('assistant', '...');
+  status.textContent = 'waiting for response...';
+
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: history, max_tokens: 512, temperature: 0.7 }),
+    });
+    const data = await res.json();
+    const reply = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
+    assistantDiv.textContent = reply;
+    history.push({ role: 'assistant', content: reply });
+    status.textContent = 'idle';
+  } catch (err) {
+    assistantDiv.textContent = 'error: ' + err;
+    status.textContent = 'error';
+  }
+});
+</script>
+</body>
+</html>

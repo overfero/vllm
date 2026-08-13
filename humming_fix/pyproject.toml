@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "humming_fix"
+version = "0.1.0"
+description = "Runtime patches for two SM75/T4 bugs in humming-kernels==0.1.10"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["humming_fix"]
+
+[tool.setuptools.package-dir]
+humming_fix = "."

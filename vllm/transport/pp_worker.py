@@ -38,9 +38,26 @@ constructs.
 from __future__ import annotations
 
 import os
+import time
 
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker
+
+# Applies the Qwen3.5 MTP + synthetic-PP compatibility patch (see that
+# module's docstring) unconditionally on import. This module is the right
+# place for it (rather than relying on PYTHONPATH/sitecustomize, which was
+# tried first and doesn't work here): `multiprocessing`'s `spawn` start
+# method - forced on by vLLM whenever CUDA is involved - clones the
+# *parent's already-computed* `sys.path` into each worker child instead of
+# re-deriving it from `PYTHONPATH` in the child's own fresh interpreter, so
+# mutating `os.environ["PYTHONPATH"]` at runtime in the parent never
+# reaches the workers (confirmed by direct reproduction: a spawned child's
+# `sys.path` omits any directory added to `PYTHONPATH` after the parent
+# interpreter itself started). This module, by contrast, is freshly
+# imported once per worker process (every worker resolves `--worker-cls`
+# via `resolve_obj_by_qualname`, re-importing this file), making it a
+# reliable per-process hook regardless of spawn/fork or PYTHONPATH.
+import vllm.transport.qwen35_mtp_pp_fix  # noqa: F401,E402
 
 logger = init_logger(__name__)
 
@@ -123,6 +140,28 @@ class TransportPPWorker(Worker):
             transport_next=transport_next,
         )
 
+        # Real bug hit running this for real (first seen on a PP=2 Qwen2.5-7B
+        # split - the vllm checkout picked up a newer worker/model_runner
+        # refactor since this project's earlier GPT-OSS/PP=3 runs): the "V2"
+        # GPUModelRunner (vllm/v1/worker/gpu/model_runner.py) caches
+        # `is_first_pp_rank`/`is_last_pp_rank` from `get_pp_group()` in its
+        # own __init__ - which super().init_device() above already ran,
+        # against the trivial single-rank `_PP` group that existed before
+        # install_transport_pp_group() just replaced it. Left unpatched,
+        # every non-last rank's cached `is_last_pp_rank` stays True, so
+        # `execute_model` asserts `isinstance(model_output, torch.Tensor)`
+        # on a rank whose model.forward() (correctly reading the LIVE swapped
+        # group) actually returned `IntermediateTensors` -
+        # `AssertionError` during the very first profile_run. Refresh the
+        # cached flags in place; harmless no-op if some future vLLM version
+        # stops caching them (attribute simply won't exist).
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            if hasattr(model_runner, "is_first_pp_rank"):
+                model_runner.is_first_pp_rank = pp_rank == 0
+            if hasattr(model_runner, "is_last_pp_rank"):
+                model_runner.is_last_pp_rank = pp_rank == pp_world_size - 1
+
         logger.info(
             "TransportPPWorker: local_rank=%s pp_rank=%s/%s transport PP "
             "group installed and connected",
@@ -130,3 +169,21 @@ class TransportPPWorker(Worker):
             pp_rank,
             pp_world_size,
         )
+        self._transport_timing_self_name = self_name
+
+    def execute_model(self, scheduler_output):
+        # Real generation-throughput investigation (2026-08-12): wraps the
+        # real execute_model() call (recv-from-prev + local forward compute
+        # + send-to-next, for a middle stage) with a total-duration log so
+        # local compute time can be derived as
+        # total_duration - sum(TRANSPORT_TIMING send/recv durations logged
+        # by udp_transport.py during this same call) - correlate by
+        # timestamp per machine, single in-flight request only.
+        _t0 = time.monotonic()
+        result = super().execute_model(scheduler_output)
+        logger.info(
+            "[EXECUTE_MODEL_TIMING] self=%s duration_ms=%.2f",
+            getattr(self, "_transport_timing_self_name", "?"),
+            (time.monotonic() - _t0) * 1000,
+        )
+        return result

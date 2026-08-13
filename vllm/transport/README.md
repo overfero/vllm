@@ -121,8 +121,8 @@ to the real data plane is explicitly deferred (§5).
 `udp_transport.py` never reimplements hole punching, STUN, signaling, or
 the wire protocol. It:
 1. Locates the existing transport's directory (`VLLM_UDP_TRANSPORT_DIR`,
-   defaulting to `/kaggle/working/udp_holepunch`) and imports `peer.py` as
-   a library.
+   defaulting to the `udp_holepunch/` sibling directory at this repo's
+   root) and imports `peer.py` as a library.
 2. Subclasses `peer.PeerProtocol` (`_AdapterProtocol`), adding handling for
    three new wire tags (`M` message chunk, `Q`/`A` status query/answer)
    that the original class doesn't recognize and therefore silently

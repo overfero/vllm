@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -293,7 +294,30 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
-        self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # Root cause of a real multi-step decode-degradation bug hit running
+        # this project's own transport-backed multi-machine PP (see
+        # vllm/transport/rpc_executor.py, scripts/launch_pp_stage.py): that
+        # setup deliberately keeps `parallel_config.pipeline_parallel_size`
+        # at 1 on every machine (real value would make vLLM try to bootstrap
+        # torch.distributed directly across NAT'd hosts) and instead swaps in
+        # a synthetic multi-machine `_PP` group post-construction. But
+        # `use_pp` gates whether `_make_cached_request_data` below populates
+        # `CachedRequestData.new_token_ids` - the ONLY way a non-last-PP-rank
+        # stage (which never samples) learns what token was actually sampled
+        # for a decode step, since it has no direct link to the last stage.
+        # With `use_pp` False, decode steps forward an EMPTY new_token_ids to
+        # remote stages: prefill still works (it carries real
+        # `prompt_token_ids` independently), but every decode step onward
+        # runs the first stage's embedding lookup on the wrong input token -
+        # a real bug reproduced identically on both a GPT-OSS-120B/GPTQ/MoE
+        # deployment and a plain unquantized Qwen2.5-7B one, so it's a
+        # pipeline bug, not a model-specific one. `VLLM_TRANSPORT_PP_WORLD_SIZE`
+        # (set by both launch_pp_stage.py and stage_server.py to the REAL
+        # cross-machine stage count) is the correct signal to fall back to
+        # here, matching what `TransportPPWorker` already uses.
+        self.use_pp = self.parallel_config.pipeline_parallel_size > 1 or (
+            int(os.environ.get("VLLM_TRANSPORT_PP_WORLD_SIZE", "1")) > 1
+        )
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).

@@ -1,110 +1,125 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vLLM over UDP hole-punching: cross-NAT pipeline-parallel serving
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+Serve a large model **pipeline-parallel across machines that don't have
+public IPs or a shared VPC** - no Ray, no gRPC, no port-forwarding, no VPN.
+Each machine punches a direct UDP path to its neighbors through NAT using
+only a small public signaling server for rendezvous, and vLLM's own
+pipeline-parallel scheduling runs on top of that transport instead of NCCL
+send/recv.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+Currently running Qwen3.5-122B-A10B-GPTQ-Int4 across 4 machines (2x Tesla
+T4 each, TP=2/PP=4, 12 layers/stage) with MTP speculative decoding enabled
+to cut down the number of network round-trips per generated token. See
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the current status, measured
+numbers, and the real bugs that had to be fixed to get MTP working across a
+synthetic (non-native) pipeline-parallel group.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+This is a fork of [vLLM](https://github.com/vllm-project/vllm) - upstream's
+own README is at [`docs/UPSTREAM_VLLM_README.md`](docs/UPSTREAM_VLLM_README.md).
 
----
+## Why
 
-## About
+vLLM's real pipeline-parallel support assumes every rank can reach every
+other rank directly (NCCL over TCP/IB, typically same datacenter or a VPC).
+That's unavailable when the machines are, say, free-tier GPU notebook
+instances on different cloud accounts with no public IP and no shared
+network - exactly the case this project targets. The fix is a drop-in
+transport swap: vLLM's PP send/recv path is redirected to a custom
+transport, and one of the transport backends is a UDP hole-punch
+implementation that only needs outbound internet + a small stateless
+signaling server, not any inbound port or VPN.
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+## Architecture
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+```
+udp_holepunch/          standalone UDP hole-punch library (signaling
+                         client/server, NAT traversal, reliable delivery
+                         on top of UDP) - no vLLM or torch dependency
 
-vLLM is fast with:
+transport_runtime/       framework-agnostic communication runtime that
+                         wraps udp_holepunch/ (and a plain TCP backend)
+                         behind one Backend interface - no vLLM
+                         dependency either; see transport_runtime/README.md
+                         and docs/ARCHITECTURE_DECISION.md for why this
+                         layer was extracted out of the vLLM adapter
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+vllm/transport/          the vLLM-specific adapter: consumes
+                         transport_runtime, replaces the pipeline-parallel
+                         dimension of vLLM's real GroupCoordinator with a
+                         transport-backed one right after local TP
+                         bootstrap (pp_worker.py, pipeline_bootstrap.py),
+                         plus a TransportExecutor for the driver rank
+                         (rpc_executor.py) - see vllm/transport/README.md
 
-vLLM is flexible and easy to use with:
+humming_fix/             SM75 (Tesla T4) runtime bugfixes for the
+                         humming-kernels MoE package this model needs,
+                         plus the checkpoint download/extraction tooling
+                         (per-stage selective shard download, memory-safe
+                         batched extraction)
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+scripts/                 stage_server.py (non-driver stage launcher) and
+                         launch_pp_stage.py (driver/vllm-serve launcher)
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+ops/                     orchestrator-side remote machine bring-up
+                         (torch/vllm/humming-kernels install, checkpoint
+                         extraction) over SSH
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+pp_tests/                launch scripts for the current cluster
+                         (pp_tests/launch/), diagnostics, and validation
+                         scripts written against real hardware
+```
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+Three-layer split (`udp_holepunch` -> `transport_runtime` -> `vllm/transport`)
+so the hole-punch transport and its generic runtime wrapper stay reusable
+outside vLLM entirely - `transport_runtime` has no vLLM or torch import in
+it. See `docs/ARCHITECTURE_DECISION.md` for the full reasoning (why extract
+at all, what was debated, what got reverted) and `transport_runtime/README.md`
+for what actually migrated vs. what's still vendored directly in
+`vllm/transport/`.
 
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+## Quick start
 
 ```bash
-uv pip install vllm
+# On each machine: install this fork's vllm (needs a CUDA GPU)
+pip install -e . --no-build-isolation   # see ops/setup_machine.sh for the
+                                         # full real bring-up (torch pin,
+                                         # precompiled-kernel workarounds,
+                                         # humming-kernels)
+
+# One machine runs the signaling server (small, CPU-only, needs a public
+# HTTP endpoint - a tunnel like zrok/ngrok/cloudflared works fine, doesn't
+# need a real public IP itself):
+python3 -m uvicorn udp_holepunch.signaling_server:app --host 0.0.0.0 --port 8765
+
+# Each machine launches its pipeline stage against that signaling URL -
+# see pp_tests/launch/launch_machine{A,B,C,D}.sh for real, current
+# example commands (model, quantization, KV cache sizing, MTP config) and
+# docs/DEPLOYMENT.md for the full walkthrough.
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+For the specific Qwen3.5/4-machine cluster this repo is currently
+validated against, `setup_cluster.sh` automates the whole bring-up
+end-to-end (torch/vllm/humming-kernels install + checkpoint extraction on
+every machine) from a `.env` with each machine's current SSH
+port/password - see `.env.example`.
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+## Status
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+Real, running, measured - not a design doc. See
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for current topology, the MTP
+bring-up (three separate real bugs found and fixed to get speculative
+decoding working across a synthetic multi-machine PP group), and measured
+throughput/latency numbers. [`docs/history/`](docs/history/) has the
+debugging history from earlier phases (GPT-OSS-120B, pre-MTP Qwen3.5).
 
-## Contributing
+## Known limitations
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+- `--enable-cudagraph` and MTP speculative decoding don't currently work
+  together (a real `torch.compile`/Dynamo limitation tracing the MTP
+  drafter) - the current MTP deployment runs the whole pipeline in eager
+  mode.
+- The UDP transport assumes real internet-routable NAT traversal is
+  possible between machines; some NAT configurations (e.g. symmetric NAT
+  on both sides) can still fail to punch through - a plain TCP backend
+  (`vllm/transport/tcp_transport.py`) is available as a fallback for
+  machines on a shared network.

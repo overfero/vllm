@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transport_runtime"
+version = "0.1.0"
+description = "Framework-agnostic distributed communication runtime (backend/codec/connection layers), extracted from vLLM's transport fork."
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["transport_runtime", "transport_runtime.backends"]

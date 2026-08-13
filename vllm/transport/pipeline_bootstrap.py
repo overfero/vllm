@@ -127,6 +127,28 @@ def install_transport_pp_group(
     group.world_size = pp_world_size
     group.ranks = list(range(pp_world_size))
     group.unique_name = f"transport_pp:{pp_rank}"
+    # `object.__new__` bypasses `GroupCoordinator.__init__` entirely (the
+    # whole point - the real `__init__` would try to form a cross-machine
+    # torch.distributed group, exactly the NAT-reachability problem this
+    # transport exists to avoid), so this synthetic group has ONLY the
+    # attributes explicitly set here - none of the real `__init__`'s
+    # NCCL/device-communicator setup ever runs. Real bug hit running this
+    # for real: `AttributeError: 'GroupCoordinator' object has no
+    # attribute 'device_communicator'` from
+    # `prepare_communication_buffer_for_model` (called unconditionally
+    # during real model loading). `None` is the correct value, not a
+    # stand-in - it makes that method's `if self.device_communicator is
+    # not None` guard a safe no-op, which is exactly right: this group's
+    # tensor exchange goes through `transport`/`transport_prev`/
+    # `transport_next` send/recv, never through a device communicator's
+    # NCCL buffer machinery.
+    group.device_communicator = None
+    # Same reasoning as `device_communicator` above - real bug hit during
+    # shutdown/teardown this time: `AttributeError: 'GroupCoordinator'
+    # object has no attribute 'mq_broadcaster'` from `destroy()`. `None`
+    # is correct: this synthetic group never had a real shared-memory
+    # broadcaster to begin with.
+    group.mq_broadcaster = None
 
     ps._PP = group
 

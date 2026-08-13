@@ -254,3 +254,14 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# --- this project's own additions (UDP hole-punch transport / MTP cluster) ---
+# Real credentials/session-specific values, never commit
+.env
+ops/machines.conf
+ops/signaling_url.txt
+ops/logs/
+pp_tests/*.log
+pp_tests/*.html
+!pp_tests/chatbot_ui.html
+.pytest_cache/

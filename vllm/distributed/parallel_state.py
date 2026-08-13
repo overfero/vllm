@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import struct
 import weakref
@@ -109,6 +110,22 @@ def _split_tensor_dict(
 _DICT_HEADER = struct.Struct("!I")
 
 
+def _debug_tensor_dict_stats(prefix: str, tensor_dict: dict[str, Any]) -> None:
+    if not os.environ.get("VLLM_TRANSPORT_DEBUG_TENSOR_STATS"):
+        return
+    import sys
+    for key, value in tensor_dict.items():
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            v = value.detach()
+            print(
+                f"[transport-debug] {prefix} key={key!r} shape={tuple(v.shape)} "
+                f"dtype={v.dtype} mean={v.float().mean().item():.6g} "
+                f"std={v.float().std().item():.6g} "
+                f"isnan={bool(torch.isnan(v).any())} isinf={bool(torch.isinf(v).any())}",
+                file=sys.stderr, flush=True,
+            )
+
+
 def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
     """GroupCoordinator.send_tensor_dict's transport-backed path (see
     vllm/transport/README.md, "Phase 4"). Reuses `_split_tensor_dict` (the
@@ -119,6 +136,7 @@ def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
     `bytes` (see vllm/transport/tensor.py's D2H/H2D note)."""
     from vllm.transport.tensor import serialize_tensor
 
+    _debug_tensor_dict_stats("SEND", tensor_dict)
     metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
     header = pickle.dumps(metadata_list)
     parts = [_DICT_HEADER.pack(len(header)), header]
@@ -153,6 +171,7 @@ def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
             result[key] = tensor
         else:
             result[key] = value
+    _debug_tensor_dict_stats("RECV", result)
     return result
 
 

@@ -34,26 +34,25 @@ real 3-stage synthetic group before `load_model()` runs is what actually
 determines each stage's real layer shard - confirmed correct by
 `tests/transport/test20_real_bootstrap_pp_three_stage.py`.
 
-KNOWN GAP - read before relying on this for online serving: vLLM's
+FORMERLY A KNOWN GAP, NOW CLOSED FOR THE DRIVER STAGE: vLLM's
 `EngineCore` computes `scheduler_output` exactly once per step (one
-`Scheduler`, `vllm/v1/engine/core.py`'s `step()`) and dispatches it to
-every worker via `Executor.collective_rpc()`. `MultiprocExecutor`'s RPC
-channel (`vllm/distributed/device_communicators/shm_broadcast.py`'s
-`MessageQueue`) supports a real network-capable "remote reader" path for
-vanilla multi-node deployments, but it connects over plain TCP
-(`connect_ip`), which assumes direct reachability between nodes - the
-exact same NAT problem this project's transport was built to solve for
-the PP tensor path specifically, not yet solved for this RPC/scheduling
-path. Concretely: this script correctly bootstraps local TP, installs
-the transport PP group, loads this stage's model shard, and connects
-this stage's transport link(s) to its neighbor(s) - all of that is real
-and covered by test18/test20. What it does NOT yet do is guarantee that
-a non-driver machine's local `EngineCore.step()` loop ever gets invoked
-with a `scheduler_output` consistent with what the request-serving
-machine decided, because nothing in this repository yet relays
-`scheduler_output` (or bridges `collective_rpc`) across machines. See
-README_RUN_GPTOSS_CLUSTER.md's "Known gap" section for the precise
-proposed fix and why it isn't implemented here.
+`Scheduler`) and dispatches it via `Executor.collective_rpc()`.
+`MultiprocExecutor`'s own remote-reader path needs direct TCP
+reachability between nodes, which this project's NAT'd machines don't
+have - so `vllm/transport/rpc_executor.py`'s `TransportExecutor` forwards
+each per-step call to every remote stage's `scripts/stage_server.py`
+over a dedicated RPC control channel instead (separate from the PP
+tensor links below). Pass `--remote-stage-names`/`--remote-stage-hosts`/
+`--num-gpu-blocks-override` (this file's own flags, above) on the ONE
+stage that runs `--serve` to enable it. Non-driver stages no longer run
+this script at all for their engine process - they run
+`scripts/stage_server.py`, which loads their shard, connects the same PP
+tensor link(s), and then waits for the driver to forward it
+`scheduler_output` instead of running its own (uncoordinated) Scheduler.
+See `vllm/transport/rpc_executor.py` and `scripts/stage_server.py` module
+docstrings for the full design, and `pp_tests/BLOCKER_REPORT.md` Blocker
+1/3 for what was verified and what still needs real 3-machine hardware to
+confirm end-to-end.
 
 Usage (see README_RUN_GPTOSS_CLUSTER.md for the exact 3-machine
 commands):
@@ -71,6 +70,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -98,13 +98,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="float16")
     p.add_argument("--quantization", default=None, choices=[None, "awq", "gptq", "awq_marlin", "gptq_marlin"])
     p.add_argument("--max-model-len", type=int, default=None)
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                    help="see stage_server.py's matching flag docstring - required <= "
+                         "--num-gpu-blocks-override for hybrid Mamba models under CUDA graph")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--language-model-only", action="store_true",
+                    help="skip the vision tower for multimodal models served text-only")
+    p.add_argument("--enable-cudagraph", action="store_true",
+                    help="EXPERIMENTAL - see stage_server.py's matching flag docstring. "
+                         "Must be passed on every stage + the driver together.")
+    p.add_argument("--speculative-config", default=None,
+                    help="Real, existing vLLM flag (JSON string), passed through as-is - "
+                         "e.g. '{\"method\": \"mtp\", \"num_speculative_tokens\": 1}' for "
+                         "Qwen3.5's native MTP draft head. Only meaningful on the DRIVER "
+                         "(this stage/--serve): the MTP module runs entirely on the last "
+                         "PP stage since it consumes the target model's own final "
+                         "hidden_states directly, no cross-machine transport of its own - "
+                         "see vllm/model_executor/models/qwen3_5_mtp.py's "
+                         "get_pp_group().is_last_rank checks. The checkpoint at --model "
+                         "must have been extracted with --include-mtp.")
 
     # --- API server (only meaningful on the stage you expose to clients) ---
     p.add_argument("--serve", action="store_true", help="expose the OpenAI-compatible API on this machine")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
+
+    # --- cross-machine scheduler_output RPC (vllm/transport/rpc_executor.py) ---
+    # Only meaningful on the DRIVER stage (the one running the real
+    # Scheduler - normally the same machine as --serve). Non-driver stages
+    # do not use this script at all anymore for their engine process - see
+    # scripts/stage_server.py, which they run instead. Closes
+    # README_RUN_GPTOSS_CLUSTER.md Task 10's "known gap".
+    p.add_argument("--remote-stage-names", default=None,
+                    help="comma-separated stage_server names this stage's Scheduler must "
+                         "drive every step, e.g. MachineA,MachineB (driver stage only)")
+    p.add_argument("--remote-stage-hosts", default=None,
+                    help="comma-separated, 1:1 with --remote-stage-names - reachable host "
+                         "for each (--transport tcp only)")
+    p.add_argument("--rpc-port", type=int, default=40000,
+                    help="port every scripts/stage_server.py listens on for the driver's "
+                         "RPC control channel (shared across stages - only the host differs)")
+    p.add_argument("--num-gpu-blocks-override", type=int, default=None,
+                    help="REQUIRED (and must be identical across all 3 machines) whenever "
+                         "--remote-stage-names is set - see rpc_executor.py module docstring "
+                         "and pp_tests/BLOCKER_REPORT.md Blocker 3 for why")
 
     p.add_argument("--dry-run", action="store_true", help="print the resulting env vars and vllm command, do not exec")
     return p
@@ -122,8 +160,19 @@ def main() -> int:
     if args.transport == "udp" and not args.signaling_url:
         print("error: --signaling-url is required for --transport udp", file=sys.stderr)
         return 2
+    if args.remote_stage_names and args.num_gpu_blocks_override is None:
+        print("error: --num-gpu-blocks-override is required when --remote-stage-names is "
+              "set (must match the value passed to every scripts/stage_server.py too)",
+              file=sys.stderr)
+        return 2
 
     env = os.environ.copy()
+    # so sitecustomize.py (in its own dedicated _pysitecustomize/ dir, NOT
+    # the project root - see that file's docstring for why) auto-applies
+    # the real SM75 humming-kernels runtime patches inside the `vllm serve`
+    # subprocess this execs into.
+    sitecustomize_dir = str(Path(__file__).resolve().parents[1].parent / "_pysitecustomize")
+    env["PYTHONPATH"] = sitecustomize_dir + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["VLLM_TRANSPORT"] = args.transport
     env["VLLM_TRANSPORT_PP_RANK"] = str(args.pp_rank)
     env["VLLM_TRANSPORT_PP_WORLD_SIZE"] = str(args.pp_world_size)
@@ -136,25 +185,70 @@ def main() -> int:
     env["VLLM_TRANSPORT_TCP_CONNECT_HOST_PREV"] = args.tcp_connect_host_prev or ""
     env["VLLM_TRANSPORT_TCP_CONNECT_HOST_NEXT"] = args.tcp_connect_host_next or ""
     env["VLLM_TRANSPORT_CONNECT_TIMEOUT"] = str(args.transport_connect_timeout)
+    if args.remote_stage_names:
+        env["VLLM_TRANSPORT_REMOTE_STAGE_NAMES"] = args.remote_stage_names
+        env["VLLM_TRANSPORT_REMOTE_STAGE_HOSTS"] = args.remote_stage_hosts or ""
+        env["VLLM_TRANSPORT_RPC_PORT"] = str(args.rpc_port)
 
+    executor_backend = (
+        "vllm.transport.rpc_executor.TransportExecutor"
+        if args.remote_stage_names
+        else "mp"
+    )
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.cli.main", "serve",
         args.model,
         "--tensor-parallel-size", str(args.tensor_parallel_size),
         "--pipeline-parallel-size", "1",  # local-only; see module docstring
-        "--distributed-executor-backend", "mp",
+        "--distributed-executor-backend", executor_backend,
         "--worker-cls", "vllm.transport.pp_worker.TransportPPWorker",
         "--dtype", args.dtype,
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--host", args.host,
         "--port", str(args.port),
+        # Real bug hit running this for real: with async scheduling on (vLLM's
+        # default whenever the executor supports it), every non-last PP rank
+        # calls _pp_receive_prev_sampled_token_ids_to_input_batch(), which does
+        # a real `torch.distributed.broadcast(..., group=pp.device_group)` to
+        # pull the last rank's sampled token ids directly - a second, separate
+        # cross-rank channel from the activation-tensor transport this project
+        # implements, and one the synthetic transport-backed PP group (built
+        # via object.__new__(), see pipeline_bootstrap.py) has no real
+        # multi-machine backing for at all
+        # (`AttributeError: 'GroupCoordinator' object has no attribute
+        # 'device_group'`). Must disable async scheduling on every stage.
+        "--no-async-scheduling",
     ]
     if args.quantization:
         cmd += ["--quantization", args.quantization]
     if args.max_model_len:
         cmd += ["--max-model-len", str(args.max_model_len)]
+    if args.max_num_seqs:
+        cmd += ["--max-num-seqs", str(args.max_num_seqs)]
+    if args.speculative_config:
+        cmd += ["--speculative-config", args.speculative_config]
     if args.trust_remote_code:
         cmd += ["--trust-remote-code"]
+    if args.language_model_only:
+        cmd += ["--language-model-only"]
+    if not args.enable_cudagraph:
+        # Default: every prior real deployment on this project forced eager
+        # execution on every stage (no CUDA graphs, no compile). Real bug hit
+        # running this for real: with only ONE stage in compiled/CUDA-graph
+        # mode, its local model runner pads intermediate-tensor shapes to the
+        # nearest cudagraph capture size (e.g. 8 for a 5-token batch) before
+        # gathering the activations the previous stage sent over the real PP
+        # transport link - but the previous stage sent the real, unpadded
+        # size (5), since it was eager. Plain shape mismatch
+        # (`RuntimeError: size of tensor a (8) must match tensor b (5)`), not
+        # a transport bug. --enable-cudagraph tests the untested hypothesis
+        # that padding agrees stage-to-stage when EVERY stage uses graphs
+        # consistently (see stage_server.py's matching flag docstring) - it
+        # must be passed on every stage + the driver together, never
+        # partially, or this exact crash reproduces.
+        cmd += ["--enforce-eager"]
+    if args.num_gpu_blocks_override is not None:
+        cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
     if not args.serve:
         # Non-serving stages still need a real engine constructed (to load
         # their shard and connect their transport link(s)) - see the

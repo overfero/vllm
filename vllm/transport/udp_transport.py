@@ -23,6 +23,7 @@ import contextlib
 import itertools
 import os
 import queue
+import random
 import socket
 import struct
 import sys
@@ -30,7 +31,10 @@ import threading
 import time
 from pathlib import Path
 
+from vllm.logger import init_logger
 from vllm.transport.base import Transport, TransportConfig
+
+logger = init_logger(__name__)
 
 
 def _locate_existing_transport_dir() -> Path:
@@ -41,7 +45,6 @@ def _locate_existing_transport_dir() -> Path:
     env_path = os.environ.get("VLLM_UDP_TRANSPORT_DIR")
     candidates = [Path(env_path)] if env_path else []
     candidates += [
-        Path("/kaggle/working/udp_holepunch"),
         Path(__file__).resolve().parents[2] / "udp_holepunch",
     ]
     for candidate in candidates:
@@ -71,6 +74,18 @@ _MAX_SEND_ATTEMPTS = 5  # 1 initial send + up to 4 resends per batch if chunks w
 _STATUS_TIMEOUT_BASE_S = 0.2  # first attempt: generous for loopback/LAN RTT, not backlog-scale
 _STATUS_TIMEOUT_BACKOFF = 2.5  # each retry waits longer, in case it's backlog, not loss
 _BATCH_CHUNKS = 500  # ~600KB per batch at CHUNK_PAYLOAD=1200
+_KEEPALIVE_INTERVAL_SECONDS = 15.0
+# Real bug hit running this across real NATs: the RPC control channel to a
+# stage sat idle for ~4 minutes while another stage finished loading weights,
+# and by the time the driver made its first real call, the NAT mapping/pinhole
+# on one or both sides had silently expired (never a code-level error - the
+# sender's status query just got no answer at all). punch_loop only runs
+# during the initial handshake and is cancelled the moment protocol.established
+# flips True, so nothing kept either side's NAT binding alive afterward. The
+# existing transport's own ping/pong (tags "P"/"O") already round-trips
+# without touching any of this adapter's own message tags, so reusing it here
+# as a periodic no-op keeps both directions' NAT state fresh for the life of
+# the connection instead of only during connect().
 # Large messages are confirmed incrementally in batches rather than one all-or-nothing
 # round at the very end. A single confirmation round over an entire multi-thousand-chunk
 # message means the receiver's single-threaded asyncio loop has to work through the whole
@@ -129,9 +144,24 @@ class _AdapterProtocol(_hp.PeerProtocol):
         self._recv_queue = recv_queue
         self._inbound: dict[int, _InboundMessage] = {}
         self.status_waiters: dict[int, asyncio.Future] = {}
+        # Real bug hit running this for real: one side's own outbound NAT
+        # (a Kaggle sandbox's cloud egress, not this project's code) round-robins
+        # across two different external IPs on a near-per-packet basis for the
+        # same 5-tuple - "NAT REBINDING DETECTED" fired dozens of times a
+        # second on the *other* side for one peer only, never for any peer
+        # whose NAT was stable. Chasing a single a `self.peer_addr` (the base
+        # class's model - fine for a NAT that's sticky per flow) means every
+        # other reply races whichever mapping is momentarily dead. Sending
+        # application-level (non-handshake) packets to every recently-seen
+        # address instead of just the latest one costs a few duplicate
+        # datagrams but reaches whichever mapping is currently live.
+        self._recent_peer_addrs: list[tuple[str, int]] = [peer_addr]
 
     def _handle_datagram(self, data: bytes, addr) -> None:
         super()._handle_datagram(data, addr)  # preserve all original behavior
+        if addr not in self._recent_peer_addrs:
+            self._recent_peer_addrs.append(addr)
+            del self._recent_peer_addrs[:-4]  # cap: a handful of recent addrs, not unbounded
         if not data:
             return
         tag = data[0:1]
@@ -148,7 +178,7 @@ class _AdapterProtocol(_hp.PeerProtocol):
                 (msg_id,) = _QUERY_HEADER.unpack(data[1:5])
                 msg = self._inbound.get(msg_id)
                 received = msg.received_bytes if msg is not None else 0
-                self.send(_STATUS_ANSWER_TAG + _STATUS_HEADER.pack(msg_id, received))
+                self.send_multi(_STATUS_ANSWER_TAG + _STATUS_HEADER.pack(msg_id, received))
             elif tag == _STATUS_ANSWER_TAG:
                 msg_id, received = _STATUS_HEADER.unpack(data[1:9])
                 fut = self.status_waiters.get(msg_id)
@@ -157,10 +187,14 @@ class _AdapterProtocol(_hp.PeerProtocol):
         except struct.error:
             return
 
+    def send_multi(self, data: bytes) -> None:
+        for addr in self._recent_peer_addrs:
+            self.transport.sendto(data, addr)
+
     async def query_status(self, msg_id: int, timeout: float) -> int | None:
         fut = self.loop.create_future()
         self.status_waiters[msg_id] = fut
-        self.send(_STATUS_QUERY_TAG + _QUERY_HEADER.pack(msg_id))
+        self.send_multi(_STATUS_QUERY_TAG + _QUERY_HEADER.pack(msg_id))
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -176,9 +210,31 @@ class UDPTransport(Transport):
         self._protocol: _AdapterProtocol | None = None
         self._transport_obj: asyncio.DatagramTransport | None = None
         self._recv_queue: "queue.Queue[bytes]" = queue.Queue()
-        self._msg_ids = itertools.count(1)
+        # Real bug hit running this for real: a stage_server.py process calls
+        # transport.connect() exactly once at startup and keeps that single
+        # _AdapterProtocol (and its _inbound dict of completed messages, kept
+        # around by design - see _AdapterProtocol's docstring) alive for its
+        # whole lifetime. If the DRIVER side later restarts (a live-debugging
+        # restart, or a crash-recovery restart in production) while the stage
+        # server keeps running, a fresh UDPTransport starting msg_id back at 1
+        # collides with the old session's already-completed _inbound[1] - the
+        # new message's real chunks get silently dropped by add_chunk's `if
+        # self.completed: return False` guard, and the status-query answer
+        # reports the STALE message's byte count, which never matches the new
+        # message's target_bytes - "batch incomplete after 5 attempts"
+        # (or, worse, a coincidentally-matching stale count that looks like
+        # success while the receiver actually got nothing new). Starting each
+        # UDPTransport instance's counter at a random offset instead of a
+        # fixed 1 makes a same-msg_id collision with any prior session
+        # astronomically unlikely.
+        self._msg_ids = itertools.count(random.randint(1, 2**31))
+        self._keepalive_task: asyncio.Task | None = None
+        self._self_id = "?"
+        self._peer_id = "?"
 
     def connect(self, config: TransportConfig) -> None:
+        self._self_id = config.self_id
+        self._peer_id = config.peer_id
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -236,12 +292,25 @@ class UDPTransport(Transport):
 
         self._transport_obj = transport
         self._protocol = protocol
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop(protocol))
+
+    async def _keepalive_loop(self, protocol: "_AdapterProtocol") -> None:
+        seq = 0
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL_SECONDS)
+            seq += 1
+            protocol.send_multi(_hp.pack_ping(seq, time.monotonic()))
 
     def send(self, data: bytes) -> None:
         if self._loop is None or self._protocol is None:
             raise RuntimeError("send() called before connect()")
+        _t0 = time.monotonic()
         fut = asyncio.run_coroutine_threadsafe(self._send_async(data), self._loop)
         fut.result()
+        logger.info(
+            "[TRANSPORT_TIMING] self=%s peer=%s op=send bytes=%d duration_ms=%.2f",
+            self._self_id, self._peer_id, len(data), (time.monotonic() - _t0) * 1000,
+        )
 
     async def _send_async(self, data: bytes) -> None:
         assert self._protocol is not None
@@ -256,7 +325,7 @@ class UDPTransport(Transport):
                 offset = offsets[idx]
                 chunk = data[offset:offset + chunk_size]
                 header = _MSG_TAG + _MSG_HEADER.pack(msg_id, total_len, offset)
-                self._protocol.send(header + chunk)
+                self._protocol.send_multi(header + chunk)
                 if j % burst == burst - 1:
                     # Real sleep, not sleep(0): gives the receiver wall-clock time to
                     # drain its socket buffer instead of overflowing it - see the
@@ -290,13 +359,21 @@ class UDPTransport(Transport):
                 await _send_indices(batch_indices)
 
     def recv(self, timeout: float | None = None) -> bytes:
+        _t0 = time.monotonic()
         try:
-            return self._recv_queue.get(timeout=timeout)
+            data = self._recv_queue.get(timeout=timeout)
         except queue.Empty:
             raise TimeoutError(f"recv() timed out after {timeout}s") from None
+        logger.info(
+            "[TRANSPORT_TIMING] self=%s peer=%s op=recv bytes=%d duration_ms=%.2f",
+            self._self_id, self._peer_id, len(data), (time.monotonic() - _t0) * 1000,
+        )
+        return data
 
     def close(self) -> None:
         if self._loop is not None:
+            if self._keepalive_task is not None:
+                self._loop.call_soon_threadsafe(self._keepalive_task.cancel)
             if self._transport_obj is not None:
                 self._loop.call_soon_threadsafe(self._transport_obj.close)
             self._loop.call_soon_threadsafe(self._loop.stop)
