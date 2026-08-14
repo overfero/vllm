@@ -76,7 +76,7 @@ from pathlib import Path
 # namespace package). patch.py itself only imports from the real `humming`
 # package + stdlib (no relative imports), so direct file-path loading is
 # safe and sidesteps sys.path entirely.
-_patch_path = Path(__file__).resolve().parents[1].parent / "humming_fix" / "patch.py"
+_patch_path = Path(__file__).resolve().parents[1] / "humming_fix" / "patch.py"
 _spec = importlib.util.spec_from_file_location("humming_fix_patch", _patch_path)
 _patch_module = importlib.util.module_from_spec(_spec)
 sys.modules["humming_fix_patch"] = _patch_module
@@ -93,7 +93,7 @@ _spec.loader.exec_module(_patch_module)  # both real SM75 fixes, before any Humm
 # sitecustomize.py there - the only way qwen35_mtp_pp_fix.py's MTP/PP
 # compat patch (see that module's docstring) reaches worker processes,
 # where the MTP drafter's dummy_run/forward actually execute.
-_sitecustomize_dir = str(Path(__file__).resolve().parents[1].parent / "_pysitecustomize")
+_sitecustomize_dir = str(Path(__file__).resolve().parents[1] / "_pysitecustomize")
 _existing_pythonpath = os.environ.get("PYTHONPATH", "")
 if _sitecustomize_dir not in _existing_pythonpath.split(os.pathsep):
     os.environ["PYTHONPATH"] = (
@@ -166,6 +166,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "candidates, and this stage's own array pre-allocation (sized for "
                          "1 token/seq) can't broadcast the larger arrays the driver sends - "
                          "'could not broadcast input array from shape (2,) into shape (1,)'.")
+    p.add_argument("--cpu-offload-gb", type=float, default=0.0,
+                    help="Real vLLM flag: offload this many GiB of model weights to "
+                         "pinned host RAM instead of GPU VRAM. Needed for an asymmetric "
+                         "PP split where a stage's real layer count doesn't fit a T4's "
+                         "14.56GiB alongside the (always-constructed-on-every-rank, see "
+                         "--speculative-config's own note above) MTP drafter's extra "
+                         "vocab embedding + decoder layer.")
     p.add_argument("--enable-cudagraph", action="store_true",
                     help="EXPERIMENTAL (2026-08-12 latency investigation): try running "
                          "with CUDA graphs instead of the eager mode every prior real "
@@ -232,6 +239,7 @@ def _build_engine_core(args: argparse.Namespace):
         gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=args.trust_remote_code,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
+        cpu_offload_gb=args.cpu_offload_gb,
         language_model_only=args.language_model_only,
         speculative_config=speculative_config,
         enforce_eager=not args.enable_cudagraph,

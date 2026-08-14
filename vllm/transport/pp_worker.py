@@ -161,6 +161,22 @@ class TransportPPWorker(Worker):
                 model_runner.is_first_pp_rank = pp_rank == 0
             if hasattr(model_runner, "is_last_pp_rank"):
                 model_runner.is_last_pp_rank = pp_rank == pp_world_size - 1
+            # NOTE: tried deleting `model_runner.drafter` here on non-last
+            # ranks to save memory (GPUModelRunner.__init__(), run inside
+            # super().init_device() above, constructs it against the
+            # trivial pre-swap `_PP` group, which is always "last rank" for
+            # a lone rank - so every stage ends up with one). Reverted: it's
+            # NOT actually dead weight - plenty of other GPUModelRunner
+            # methods (execute_model, initialize_kv_cache, dummy_run, ...)
+            # reference `self.drafter` unconditionally whenever
+            # `self.speculative_config` is set, with no is_last_rank guard,
+            # so a non-last rank with speculative_config set (required on
+            # every stage - see docs/DEPLOYMENT.md's MTP section, fix 2)
+            # genuinely needs a real `self.drafter` object to exist. Deleting
+            # it crashed real generation with `AttributeError: 'GPUModelRunner'
+            # object has no attribute 'drafter'` the first time this was
+            # tried for real. If per-stage memory is tight on an asymmetric
+            # split, reduce --num-gpu-blocks-override for that stage instead.
 
         logger.info(
             "TransportPPWorker: local_rank=%s pp_rank=%s/%s transport PP "

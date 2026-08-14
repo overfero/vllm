@@ -87,10 +87,12 @@ Options:
   --password PASS            SSH password (required)
   --name NAME                label for log output (default: machine)
   --only STAGE[,STAGE...]    run only these stages (code,torch,so,vllm,humming,extract,verify)
-  --extract-stage S:E:OUT[:globals]
+  --extract-stage S:E:OUT[:globals][:mtp]
                               selectively download + extract layers [S,E) to OUT
                               (48 total hidden layers; append :globals for
-                              embed_tokens/norm/lm_head - first/last stage only)
+                              embed_tokens/norm/lm_head - first/last stage only;
+                              append :mtp for the MTP drafter weights - driver
+                              stage only, e.g. S:E:OUT:globals:mtp)
   --keep-full-checkpoint      do not delete the downloaded checkpoint shards at
                               $CHECKPOINT_DIR after --extract-stage. DANGEROUS if
                               anything else large is already on disk - see
@@ -266,10 +268,11 @@ stage_humming() {
 
 stage_extract() {
   [[ -n "$EXTRACT_SPEC" ]] || { log "no --extract-stage given, skipping"; return; }
-  local start end out globals flag keep_flag
-  IFS=':' read -r start end out globals <<< "$EXTRACT_SPEC"
+  local start end out rest flag keep_flag
+  IFS=':' read -r start end out rest <<< "$EXTRACT_SPEC"
   flag=""
-  [[ "$globals" == "globals" ]] && flag="--include-globals"
+  [[ "$rest" == *"globals"* ]] && flag="$flag --include-globals"
+  [[ "$rest" == *"mtp"* ]] && flag="$flag --include-mtp"
   keep_flag=""
   [[ "$KEEP_FULL_CHECKPOINT" -eq 1 ]] && keep_flag="--keep-full-checkpoint"
 

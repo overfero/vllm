@@ -62,5 +62,7 @@ every path assumption in the launch scripts depends on that symmetry.
 ## Stage/topology reference
 
 Current cluster: 4 machines, 48 layers, TP=2 per machine, PP=4 across
-machines, 12 layers/stage. See `docs/DEPLOYMENT.md` for the full table and
+machines, asymmetric 16/16/12/4 layers/stage (see `docs/DEPLOYMENT.md`'s
+"Asymmetric PP splits" section for what an uneven split requires beyond
+just the checkpoint ranges below). See `docs/DEPLOYMENT.md` for the full table and
 `pp_tests/launch/` for the actual launch commands.

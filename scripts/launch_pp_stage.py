@@ -171,7 +171,7 @@ def main() -> int:
     # the project root - see that file's docstring for why) auto-applies
     # the real SM75 humming-kernels runtime patches inside the `vllm serve`
     # subprocess this execs into.
-    sitecustomize_dir = str(Path(__file__).resolve().parents[1].parent / "_pysitecustomize")
+    sitecustomize_dir = str(Path(__file__).resolve().parents[1] / "_pysitecustomize")
     env["PYTHONPATH"] = sitecustomize_dir + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["VLLM_TRANSPORT"] = args.transport
     env["VLLM_TRANSPORT_PP_RANK"] = str(args.pp_rank)

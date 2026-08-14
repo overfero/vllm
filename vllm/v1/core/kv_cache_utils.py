@@ -1254,6 +1254,35 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # Real bug hit running this for real: in this project's synthetic
+    # multi-machine PP (each stage is its own fully independent vLLM engine
+    # process, only aware of the layers its own checkpoint shard contains -
+    # see vllm/transport/pipeline_bootstrap.py), group_size above is derived
+    # from THIS STAGE's own local layer counts. For an asymmetric PP split
+    # (e.g. 16/16/12/4 layers across 4 stages instead of a uniform 12 each),
+    # different stages land on different group_size values even though they
+    # all share the same underlying layer_types pattern, because
+    # min_num_layers/max_num_layers above are absolute per-stage counts, not
+    # normalized to the pattern period. The result: the driver's centrally
+    # scheduled `block_ids` tuple (shaped for the driver's own group count)
+    # gets applied on other stages expecting a DIFFERENT group count ->
+    # `IndexError: tuple index out of range` in block_table.py's add_row on
+    # the very first real generation request (confirmed - every stage
+    # reached this point in real testing before crashing there). Real
+    # (non-synthetic) vLLM PP doesn't hit this because group computation
+    # there is coordinated across ranks from the FULL model's layer_types
+    # (see this function's own PP docstring/comment above, e.g.
+    # "stage 0: full.0,sw.0,sw.1 / stage 1: full.1,sw.2,sw.3 -> 3 groups"),
+    # not recomputed independently per rank from a local subset. Fix: let
+    # every stage agree on the SAME group_size by deriving it from the
+    # FULL model's layer pattern once, passed in via env var (set by
+    # ops/launch scripts to the same value on every stage - see
+    # docs/DEPLOYMENT.md's asymmetric-split section), instead of each
+    # stage independently re-deriving it from its own partial layer count.
+    import os
+    _group_size_override = os.environ.get("VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE")
+    if _group_size_override:
+        group_size = int(_group_size_override)
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
