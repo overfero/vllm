@@ -112,9 +112,9 @@ log "signaling URL: $SIGNALING_URL"
 curl -s -m 10 "$SIGNALING_URL/docs" -o /dev/null -w "[setup] public signaling URL check: HTTP %{http_code}\n" || true
 
 if [[ ! -f /data/stage0-checkpoint/model.safetensors.index.json ]]; then
-  log "stage0-checkpoint missing, selectively downloading + extracting (layers 0-15 + globals)..."
+  log "stage0-checkpoint missing, selectively downloading + extracting (layers 0-11 + globals)..."
   mkdir -p /data/models
-  (cd humming_fix/single_layer_probe && python3 download_and_extract_qwen35_stage.py --start 0 --end 16 --out /data/stage0-checkpoint --checkpoint-dir "$CHECKPOINT_DIR" --include-globals 2>&1 | tail -40)
+  (cd humming_fix/single_layer_probe && python3 download_and_extract_qwen35_stage.py --start 0 --end 12 --out /data/stage0-checkpoint --checkpoint-dir "$CHECKPOINT_DIR" --include-globals 2>&1 | tail -40)
   log "stage0-checkpoint ready, downloaded shards deleted"
 else
   log "stage0-checkpoint already present"
@@ -147,9 +147,9 @@ deploy_remote_stage() {
     "rm -rf $CHECKPOINT_DIR" 2>/dev/null || true
 }
 
-deploy_remote_stage "MachineB" "$MACHINE_B_PORT" "$MACHINE_B_PASSWORD" 16 32 /data/stage1-checkpoint
-deploy_remote_stage "MachineC" "$MACHINE_C_PORT" "$MACHINE_C_PASSWORD" 32 44 /data/stage2-checkpoint
-deploy_remote_stage "MachineD" "$MACHINE_D_PORT" "$MACHINE_D_PASSWORD" 44 48 /data/stage3-checkpoint ":globals:mtp"
+deploy_remote_stage "MachineB" "$MACHINE_B_PORT" "$MACHINE_B_PASSWORD" 12 24 /data/stage1-checkpoint
+deploy_remote_stage "MachineC" "$MACHINE_C_PORT" "$MACHINE_C_PASSWORD" 24 36 /data/stage2-checkpoint
+deploy_remote_stage "MachineD" "$MACHINE_D_PORT" "$MACHINE_D_PASSWORD" 36 48 /data/stage3-checkpoint ":globals:mtp"
 
 log "=== all 4 machines restored ==="
 log "signaling URL for launch commands: $SIGNALING_URL"

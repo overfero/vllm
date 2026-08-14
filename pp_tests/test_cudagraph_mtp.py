@@ -50,6 +50,7 @@ def main() -> int:
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--num-gpu-blocks-override", type=int, default=60)
     p.add_argument("--max-num-seqs", type=int, default=8)
+    p.add_argument("--cpu-offload-gb", type=float, default=0.0)
     args = p.parse_args()
 
     os.environ["PROFILE_PP_RANK"] = str(args.pp_rank)
@@ -74,6 +75,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
         max_num_seqs=args.max_num_seqs,
+        cpu_offload_gb=args.cpu_offload_gb,
         speculative_config={"method": "mtp", "num_speculative_tokens": 1},
     )
     vllm_config = engine_args.create_engine_config()

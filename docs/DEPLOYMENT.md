@@ -16,17 +16,19 @@ stay unquantized). Natively multimodal; served **text-only** via
 
 4 machines, 2x Tesla T4 (16GB) each - 8 GPUs / 128GB VRAM total.
 TP=2 per machine (real NCCL, local only), PP=4 across machines (this
-project's UDP hole-punch transport). **Asymmetric** split, 16/16/12/4
-decoder layers per stage (not the uniform 12/12/12/12 this project
-started with - see "Asymmetric PP splits" below for what an uneven split
-requires that a uniform one doesn't):
+project's UDP hole-punch transport). **Uniform** 12/12/12/12 decoder
+layers per stage. An asymmetric split (16/16/12/4) was tried and made
+fully correct and working (see "Asymmetric PP splits" below - the
+findings there stay valid and are worth reading if revisiting this), but
+was reverted back to uniform by deliberate choice, not because the
+asymmetric split was broken:
 
 | Machine | pp-rank | layers | globals | role |
 |---|---|---|---|---|
-| A | 0 | 0-15 | embed_tokens, norm, lm_head | first stage |
-| B | 1 | 16-31 | - | middle stage |
-| C | 2 | 32-43 | - | middle stage |
-| D | 3 | 44-47 | embed_tokens, norm, lm_head, **MTP drafter** | driver, serves HTTP |
+| A | 0 | 0-11 | embed_tokens, norm, lm_head | first stage |
+| B | 1 | 12-23 | - | middle stage |
+| C | 2 | 24-35 | - | middle stage |
+| D | 3 | 36-47 | embed_tokens, norm, lm_head, **MTP drafter** | driver, serves HTTP |
 
 Checkpoint extraction is selective (`hf download --include <only the
 shards a stage's layer range touches>`) - each 12-layer stage pulls
@@ -106,11 +108,38 @@ took three real, separate fixes:
    worker process genuinely re-imports that file once as part of resolving
    `--worker-cls`, regardless of spawn/fork or `PYTHONPATH`.
 
-**Known limitation, not fixed**: `--enable-cudagraph` together with MTP hits
-a real `torch.compile`/Dynamo limitation tracing the MTP drafter's forward
-(`Data-dependent assertion failed (cannot compile partial graph)`). Current
-deployment runs the whole pipeline in eager mode when MTP is enabled -
-CUDA graphs and MTP have not been made to work together.
+**Previously-documented limitation, since resolved**: this doc used to say
+`--enable-cudagraph` together with MTP hit a real `torch.compile`/Dynamo
+limitation tracing the MTP drafter's forward (`Data-dependent assertion
+failed (cannot compile partial graph)`), forcing eager mode whenever MTP
+is enabled. Whatever caused that no longer reproduces on this checkout -
+confirmed two ways on 2026-08-14:
+
+1. Isolated: `pp_tests/test_cudagraph_mtp.py` against the driver's real
+   4-layer+MTP stage checkpoint (the split at the time), no
+   `--cpu-offload-gb` - both the main model's `torch.compile` and the MTP
+   drafter's own separate compile (`eagle_head` cache dir) succeed, CUDA
+   graphs actually capture, `EngineCore` constructs with `RESULT: SUCCESS`.
+2. Full cluster, real generation: all 4 stages at the current uniform
+   12-layer split with `--enable-cudagraph` on every stage - **without**
+   `--cpu-offload-gb`, 3 of 4 stages hit real `CUDA out of memory` (not a
+   Dynamo/compile error - a genuine memory shortage) specifically during
+   the CUDA-graph-capture step (`private pools (e.g., CUDA Graphs)` in the
+   OOM message; ~1-1.4GiB free per GPU right before capture wasn't enough
+   headroom once capture ran across every batch size, not just one). Fixed
+   with a small `--cpu-offload-gb 1` on every stage (not just the tight
+   ones - applied uniformly for simplicity) - all 4 stages then compiled,
+   captured graphs, and connected cleanly, and a real `/v1/completions`
+   request returned correct output in **6.4s** (vs. ~20s in eager mode for
+   a comparable request) with a **92.9%** MTP draft-acceptance rate.
+   `--cpu-offload-gb` needed adding as a passthrough flag to
+   `scripts/launch_pp_stage.py` too (the driver's script), not just
+   `stage_server.py` - both only forward a curated arg allowlist to
+   `EngineArgs`/the underlying `vllm serve` CLI, `--cpu-offload-gb` wasn't
+   in either by default.
+
+Current launch scripts pass `--enable-cudagraph --cpu-offload-gb 1` on
+every stage.
 
 **Real GPU-memory cost, not just correctness**: the drafter object
 (`self.drafter` in `GPUModelRunner`) gets constructed on **every** stage,
@@ -129,11 +158,17 @@ unconditionally whenever `self.speculative_config` is set, with no
 with this overhead present (as with the 16-layer stages below), use
 `--cpu-offload-gb` instead of trying to remove the drafter.
 
-## Asymmetric PP splits
+## Asymmetric PP splits (historical - not the current deployment)
 
-Splitting the 48 layers unevenly across stages (this deployment's
-16/16/12/4, vs. the uniform 12/12/12/12 this project started with) is
-**not** just a checkpoint-extraction range change. Two real, separate
+The current deployment reverted to the uniform 12/12/12/12 split above.
+This section documents real findings from a 16/16/12/4 asymmetric-split
+attempt that was made to work correctly end-to-end (including real,
+correct generation output) before being reverted by choice - kept here
+because the same issues will resurface if anyone tries an uneven split
+again, on this model or another hybrid-attention one.
+
+Splitting the 48 layers unevenly across stages is **not** just a
+checkpoint-extraction range change. Two real, separate
 fixes were needed, both because each stage here runs as its own fully
 independent vLLM engine process (only aware of its own checkpoint shard's
 layers - see `vllm/transport/pipeline_bootstrap.py`), unlike real vLLM PP
@@ -218,6 +253,17 @@ tok/s on the equivalent non-MTP 4-stage eager baseline. Each accepted
 speculative token amortizes one full network round-trip across the
 pipeline, which is the whole reason MTP was worth pursuing here (compute
 was never the bottleneck - round-trips were).
+
+**MTP + CUDA graphs together, 4 machines, `--cpu-offload-gb 1`** (2026-08-14,
+current deployment): a short `/v1/completions` request (30 completion
+tokens, temperature 0) returned correct output in **6.4s**, vs. ~20s for
+a comparable request in the earlier eager+MTP-only measurement above -
+consistent with cudagraph's compute speedup actually compounding with
+MTP's round-trip savings now that both work together. MTP draft
+acceptance rate on this run: **92.9%**. Not yet re-measured as a
+steady-state tok/s figure over a long generation the way the eager-only
+number above was - treat the eager ~3.9 tok/s as the more rigorous
+baseline until this is.
 
 ## Known environment gotchas (if reproducing this)
 

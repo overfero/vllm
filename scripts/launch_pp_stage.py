@@ -143,6 +143,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="REQUIRED (and must be identical across all 3 machines) whenever "
                          "--remote-stage-names is set - see rpc_executor.py module docstring "
                          "and pp_tests/BLOCKER_REPORT.md Blocker 3 for why")
+    p.add_argument("--cpu-offload-gb", type=float, default=0.0,
+                    help="Real vLLM flag: offload this many GiB of model weights to pinned "
+                         "host RAM instead of GPU VRAM - see stage_server.py's matching flag "
+                         "docstring for why this stage's real footprint (weights + the "
+                         "always-constructed-on-every-rank MTP drafter + CUDA graph capture "
+                         "buffers, if --enable-cudagraph) may not fit a T4's 14.56GiB without it.")
 
     p.add_argument("--dry-run", action="store_true", help="print the resulting env vars and vllm command, do not exec")
     return p
@@ -249,6 +255,8 @@ def main() -> int:
         cmd += ["--enforce-eager"]
     if args.num_gpu_blocks_override is not None:
         cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
+    if args.cpu_offload_gb:
+        cmd += ["--cpu-offload-gb", str(args.cpu_offload_gb)]
     if not args.serve:
         # Non-serving stages still need a real engine constructed (to load
         # their shard and connect their transport link(s)) - see the

@@ -7,6 +7,6 @@
 # Machine A (this local sandbox) is not listed here - it's the
 # orchestrator itself, set up directly (see ops/README.md).
 
-# machineB 9194 REPLACE_ME --extract-stage 16:32:/data/stage1-checkpoint
-# machineC 9195 REPLACE_ME --extract-stage 32:44:/data/stage2-checkpoint
-# machineD 9193 REPLACE_ME --extract-stage 44:48:/data/stage3-checkpoint:globals:mtp
+# machineB 9194 REPLACE_ME --extract-stage 12:24:/data/stage1-checkpoint
+# machineC 9195 REPLACE_ME --extract-stage 24:36:/data/stage2-checkpoint
+# machineD 9193 REPLACE_ME --extract-stage 36:48:/data/stage3-checkpoint:globals:mtp
