@@ -1,6 +1,6 @@
 #!/bin/bash
 : "${SIGNALING_URL:?set SIGNALING_URL to the orchestrator signaling server URL, e.g. https://your-tunnel.example.com}"
-cd /kaggle/working/vllm
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # Uniform 12/12/12/12 split (back from the 16/16/12/4 asymmetric-split
 # experiment - see docs/DEPLOYMENT.md's "Asymmetric PP splits" section for
 # why an uneven split needs extra care this uniform one doesn't). Kept

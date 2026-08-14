@@ -1,6 +1,6 @@
 #!/bin/bash
 : "${SIGNALING_URL:?set SIGNALING_URL to the orchestrator signaling server URL, e.g. https://your-tunnel.example.com}"
-cd /kaggle/working/vllm
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export VLLM_PP_LAYER_PARTITION="12,12,12,12"
 export VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE="12"
 python3 -u scripts/stage_server.py \

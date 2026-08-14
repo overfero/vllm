@@ -3,8 +3,10 @@
 These scripts run FROM this sandbox (the orchestrator, Machine A) and set
 up the remote machines over SSH: sync this whole repo, install torch/vllm/
 humming-kernels, selectively download + extract each machine's checkpoint
-stage. `setup_cluster.sh` (repo root) drives this for the current 4-machine
-cluster end-to-end; use the scripts here directly for anything more
+stage. `cluster/qwen35_122ba10b_3machine.sh` (repo root) drives this for
+the 3-machine/no-MTP variant end-to-end; the 4-machine/MTP cluster's
+bring-up is manual (see docs/DEPLOYMENT.md) but still calls these same
+scripts per machine; use the scripts here directly for anything more
 ad hoc (a single machine, a different stage split, re-running just one
 stage).
 
@@ -44,7 +46,8 @@ Runs every machine's setup in parallel; logs land in `ops/logs/<name>.log`
 ## Local machine (this sandbox, Machine A)
 
 Not scripted the same way since it's the orchestrator itself and doesn't
-need SSH/rsync to reach - `setup_cluster.sh` handles Machine A's own
+need SSH/rsync to reach - `cluster/qwen35_122ba10b_3machine.sh` (or the
+manual 4-machine bring-up in docs/DEPLOYMENT.md) handles Machine A's own
 torch/vllm/humming-kernels install and checkpoint extraction directly
 (no SSH). If it ever needs redoing from scratch, follow the same steps
 `setup_machine.sh`'s stages encode, run locally instead of over `rssh`.

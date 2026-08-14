@@ -43,19 +43,38 @@ size - the original single-dict-then-one-save_file() approach drove RSS to
 
 ## Bring-up
 
+Only 3 machines available (this sandbox + 2 remote, no MTP)?
+`cluster/qwen35_122ba10b_3machine.sh` is a one-shot script for exactly
+that - see its own header for details.
+
+For the full 4-machine/MTP cluster, bring-up is per-machine, by hand:
+
 ```bash
 cp .env.example .env   # fill in current session's MACHINE_B/C/D port+password
-./setup_cluster.sh
-export SIGNALING_URL=https://your-tunnel   # printed by setup_cluster.sh
-./pp_tests/launch/launch_machineA.sh                                    # local
+
+# restore each remote machine's environment + checkpoint shard
+bash ops/setup_machine.sh --port "$MACHINE_B_PORT" --password "$MACHINE_B_PASSWORD" --name MachineB \
+  --extract-stage 12:24:/data/stage1-checkpoint
+bash ops/setup_machine.sh --port "$MACHINE_C_PORT" --password "$MACHINE_C_PASSWORD" --name MachineC \
+  --extract-stage 24:36:/data/stage2-checkpoint
+bash ops/setup_machine.sh --port "$MACHINE_D_PORT" --password "$MACHINE_D_PASSWORD" --name MachineD \
+  --extract-stage 36:48:/data/stage3-checkpoint:globals:mtp
+
+# start the signaling server (this sandbox), then launch all 4 stages
+# within seconds of each other - see pp_tests/launch/launch_machine{A,B,C,D}.sh
+python3 -m uvicorn udp_holepunch.signaling_server:app --host 0.0.0.0 --port 8765 &
+export SIGNALING_URL=https://your-tunnel   # any HTTP tunnel to :8765
+./pp_tests/launch/launch_machineA.sh                                                    # local
 ssh machineB 'cd /kaggle/working/vllm && SIGNALING_URL=... pp_tests/launch/launch_machineB.sh'
 ssh machineC 'cd /kaggle/working/vllm && SIGNALING_URL=... pp_tests/launch/launch_machineC.sh'
 ssh machineD 'cd /kaggle/working/vllm && SIGNALING_URL=... pp_tests/launch/launch_machineD.sh'  # driver, :8080
 ```
 
-Order doesn't matter much - every stage retries hole-punching against the
-signaling server until its neighbors show up (`--transport-connect-timeout`,
-default 300s in the launch scripts; raise it for slow/high-latency links).
+All 4 stages need to launch within seconds of each other - every stage
+retries hole-punching against the signaling server until its neighbors
+show up (`--transport-connect-timeout`, default 300s in the launch
+scripts; raise it for slow/high-latency links), but a badly staggered
+start can still hit a real connect-timeout.
 
 ## MTP (multi-token prediction / speculative decoding)
 

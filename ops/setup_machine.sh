@@ -228,7 +228,7 @@ stage_vllm() {
   rssh "timeout 480 env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/dummy_vllm_wheel.whl pip install -e . --no-build-isolation --no-deps 2>&1 | tail -30"
   rssh "timeout 900 env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/dummy_vllm_wheel.whl pip install -e . --no-build-isolation 2>&1 | tail -40"
   local ok
-  ok=$(rssh "python3 -c 'import vllm._C_stable_libtorch; print(\"COMPILED_KERNELS_OK\")' 2>&1" || true)
+  ok=$(rssh "python3 -c 'import torch; import vllm._C_stable_libtorch; print(\"COMPILED_KERNELS_OK\")' 2>&1" || true)
   if [[ "$ok" != *COMPILED_KERNELS_OK* ]]; then
     log "ERROR: vllm compiled-kernel import failed:"
     log "$ok"
@@ -283,7 +283,7 @@ stage_extract() {
 stage_verify() {
   log "final verification..."
   rssh "python3 -c 'import torch; print(\"torch:\", torch.__version__); print(\"cuda:\", torch.cuda.is_available()); print(\"gpus:\", torch.cuda.device_count())'"
-  rssh "python3 -c 'import vllm._C_stable_libtorch; print(\"vllm compiled kernels: OK\")'"
+  rssh "python3 -c 'import torch; import vllm._C_stable_libtorch; print(\"vllm compiled kernels: OK\")'"
   rssh "pip show humming-kernels 2>&1 | grep Version"
   rssh "nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader"
   rssh "df -h / | tail -1"

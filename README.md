@@ -76,29 +76,31 @@ reviving that extraction is ever worth it.
 
 ## Quick start
 
+Only 2 remote machines available (no MTP)? `cluster/qwen35_122ba10b_3machine.sh`
+is a one-shot script for exactly that: 3 machines total (this sandbox +
+2 remote), 48 layers split 16/16/16, no MTP.
+
 ```bash
-# On each machine: install this fork's vllm (needs a CUDA GPU)
-pip install -e . --no-build-isolation   # see ops/setup_machine.sh for the
-                                         # full real bring-up (torch pin,
-                                         # precompiled-kernel workarounds,
-                                         # humming-kernels)
-
-# One machine runs the signaling server (small, CPU-only, needs a public
-# HTTP endpoint - a tunnel like zrok/ngrok/cloudflared works fine, doesn't
-# need a real public IP itself):
-python3 -m uvicorn udp_holepunch.signaling_server:app --host 0.0.0.0 --port 8765
-
-# Each machine launches its pipeline stage against that signaling URL -
-# see pp_tests/launch/launch_machine{A,B,C,D}.sh for real, current
-# example commands (model, quantization, KV cache sizing, MTP config) and
-# docs/DEPLOYMENT.md for the full walkthrough.
+git clone <this repo> && cd vllm
+cp .env.example .env   # fill in current session's MACHINE_B/C SSH port+password
+./cluster/qwen35_122ba10b_3machine.sh
 ```
 
-For the specific Qwen3.5/4-machine cluster this repo is currently
-validated against, `setup_cluster.sh` automates the whole bring-up
-end-to-end (torch/vllm/humming-kernels install + checkpoint extraction on
-every machine) from a `.env` with each machine's current SSH
-port/password - see `.env.example`.
+For the full 4-machine/MTP cluster this repo is currently validated
+against, there's no single wrapper script yet - see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the manual per-machine
+bring-up (`ops/setup_machine.sh` for B/C/D, then the individual
+`pp_tests/launch/launch_machine{A,B,C,D}.sh` scripts).
+
+The pieces are reusable independently for a different topology/model too:
+`ops/setup_machine.sh` for the per-machine environment bring-up (torch
+pin, precompiled-kernel workarounds, humming-kernels), a signaling server
+for hole-punch rendezvous (`python3 -m uvicorn
+udp_holepunch.signaling_server:app --host 0.0.0.0 --port 8765` - any
+public HTTP tunnel works, doesn't need a real public IP), and
+`pp_tests/launch/launch_machine{A,B,C,D}.sh` as worked examples of the
+actual `scripts/stage_server.py`/`scripts/launch_pp_stage.py` invocations
+(model, quantization, KV cache sizing, MTP config).
 
 ## Status
 
