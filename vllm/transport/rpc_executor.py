@@ -143,6 +143,7 @@ _ENV_BATCH_QUEUE_SIZE = "VLLM_TRANSPORT_BATCH_QUEUE_SIZE"
 # of two. Independent toggle from pipelining itself so each can be
 # benchmarked/rolled back separately.
 _ENV_ENABLE_FUSION = "VLLM_TRANSPORT_ENABLE_RPC_FUSION"
+_ENV_DEBUG_TIMING = "VLLM_TRANSPORT_DEBUG_TIMING"
 
 _DEFAULT_RPC_PORT = 40000
 
@@ -437,7 +438,7 @@ class TransportExecutor(MultiprocExecutor):
             # here, same net effect as the non-pipelined branch below.
             reply_future = self._dispatch_remote_pipelined_start(link, method, args, kwargs)
             return self._resolve_pipelined(link, method, reply_future)
-        debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+        debug_timing = os.environ.get(_ENV_DEBUG_TIMING)
         t0 = time.perf_counter() if debug_timing else 0.0
         payload = cloudpickle.dumps((method, args, kwargs), protocol=pickle.HIGHEST_PROTOCOL)
         t1 = time.perf_counter() if debug_timing else 0.0
@@ -486,6 +487,18 @@ class TransportExecutor(MultiprocExecutor):
             (request_id, method, args, kwargs), protocol=pickle.HIGHEST_PROTOCOL
         )
         reply_future: "Future[tuple[str, object]]" = Future()
+        # 2026-08-15 hop-time profiling: the old [rpc-timing] instrumentation
+        # in _dispatch_remote (pickle/send/wait_recv split) only runs on the
+        # non-pipelined path - dead code whenever --enable-pipelining is on,
+        # which is every real deployment that cares about this. Stash the
+        # send timestamp + payload size directly on the Future (plain attr
+        # assignment - concurrent.futures.Future has no __slots__, so this
+        # is safe) so _resolve_pipelined can log a real round-trip number
+        # for the pipelined path too, from whichever thread ends up waiting
+        # on it (_combine, running on _combine_pool - never this thread).
+        if os.environ.get(_ENV_DEBUG_TIMING):
+            reply_future._debug_t_send = time.perf_counter()  # type: ignore[attr-defined]
+            reply_future._debug_payload_bytes = len(payload)  # type: ignore[attr-defined]
         with link.pending_lock:
             link.pending[request_id] = reply_future
         try:
@@ -500,6 +513,15 @@ class TransportExecutor(MultiprocExecutor):
         self, link: _RemoteStageLink, method: str, reply_future: "Future[tuple[str, object]]"
     ):
         status, result = reply_future.result(timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
+        t_send = getattr(reply_future, "_debug_t_send", None)
+        if t_send is not None:
+            round_trip_ms = 1000 * (time.perf_counter() - t_send)
+            payload_bytes = getattr(reply_future, "_debug_payload_bytes", -1)
+            print(
+                f"[rpc-pipelined-timing] {link.name} {method}: "
+                f"round_trip={round_trip_ms:.1f}ms payload_bytes={payload_bytes}",
+                flush=True,
+            )
         if status != _STATUS_OK:
             raise RuntimeError(f"remote stage {link.name!r} failed method {method!r}: {result}")
         return result
