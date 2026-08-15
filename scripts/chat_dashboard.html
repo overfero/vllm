@@ -218,7 +218,26 @@ const clearBtn = document.getElementById("clear-btn");
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
 
-let history = []; // [{role, content}]
+// Real behavior found testing this checkpoint directly: without any
+// nudge it either skips <think>...</think> entirely and rambles in plain
+// "Thinking Process:" prose with no clean end boundary, or (with
+// chat_template_kwargs.enable_thinking:true) still doesn't reliably close
+// the tag. A system prompt asking for the tag AND brevity fixed both -
+// closes with a real </think> and keeps the reasoning to a few sentences
+// instead of multiple full drafts. Kept out of the visible chat history
+// (first array entry, never rendered as a bubble) but sent with every
+// request.
+const SYSTEM_PROMPT =
+  "When you need to reason through a problem, think through it briefly, " +
+  "then close your reasoning with </think> before giving the final " +
+  "answer. Keep the reasoning short - a few sentences at most. Don't " +
+  "write multiple drafts or restate the question at length.";
+
+function freshHistory() {
+  return [{ role: "system", content: SYSTEM_PROMPT }];
+}
+
+let history = freshHistory(); // [{role, content}]
 let streaming = false;
 let abortController = null;
 
@@ -307,27 +326,34 @@ function renderAssistantMarkdown(rawText, showCursor) {
 }
 
 // ---------- <think>...</think> splitting ----------
-// Streaming-safe: while <think> has opened but </think> hasn't arrived
-// yet, everything after the open tag is "still thinking" and goes in the
-// collapsible block; once the close tag lands, the block is finalized and
-// everything after it renders as the normal answer. Some responses never
-// use the tag at all (this checkpoint's own reasoning style is often
-// plain "Thinking Process:" prose with no tag - see chat with the user
-// about this) - those just fall through untouched as regular content.
-function splitThinking(text) {
-  const openIdx = text.indexOf("<think>");
-  if (openIdx === -1) {
-    return { thinking: null, thinkingDone: true, content: text };
-  }
-  const before = text.slice(0, openIdx);
-  const afterOpen = text.slice(openIdx + "<think>".length);
-  const closeIdx = afterOpen.indexOf("</think>");
+// Real quirk found testing this for real: chat_template.jinja's
+// add_generation_prompt block auto-inserts the OPENING "<think>\n" itself
+// before the model's own generation starts (see the "else" branch at
+// line ~152, the "enable_thinking is false" branch instead emits an
+// already-empty "<think>\n\n</think>\n\n" pair) - the model's own
+// completion text only ever contains (at most) the CLOSING </think>,
+// never the opening tag, since that's already been consumed by the
+// prompt. So every response effectively starts inside an implicit,
+// already-open think block - look for </think> alone, don't wait for an
+// opening tag that will never appear in `content`.
+//
+// isFinal (true once the stream has fully ended): if </think> never
+// showed up in the whole response, there was no separate reasoning phase
+// at all for this turn (short/simple answers can skip it even with the
+// system prompt nudging the model toward using it) - fall back to
+// treating everything as the plain answer instead of leaving it stuck
+// inside a "still thinking" box forever.
+function splitThinking(text, isFinal) {
+  const closeIdx = text.indexOf("</think>");
   if (closeIdx === -1) {
-    return { thinking: afterOpen, thinkingDone: false, content: before };
+    if (isFinal) {
+      return { thinking: null, thinkingDone: true, content: text };
+    }
+    return { thinking: text, thinkingDone: false, content: "" };
   }
-  const thinking = afterOpen.slice(0, closeIdx);
-  const rest = afterOpen.slice(closeIdx + "</think>".length).replace(/^\n+/, "");
-  return { thinking, thinkingDone: true, content: before + rest };
+  const thinking = text.slice(0, closeIdx);
+  const rest = text.slice(closeIdx + "</think>".length).replace(/^\n+/, "");
+  return { thinking, thinkingDone: true, content: rest };
 }
 
 function decorateCodeBlocks(container) {
@@ -427,8 +453,8 @@ async function sendMessage() {
   sendBtn.classList.add("stop");
   abortController = new AbortController();
 
-  function renderTurn(showCursor) {
-    const { thinking, thinkingDone, content } = splitThinking(accumulated);
+  function renderTurn(showCursor, isFinal) {
+    const { thinking, thinkingDone, content } = splitThinking(accumulated, !!isFinal);
     if (thinking !== null) {
       thinkingBlock.style.display = "block";
       if (thinkStartedAt === null) thinkStartedAt = performance.now();
@@ -494,12 +520,12 @@ async function sendMessage() {
     // <think> block - keeps multi-turn context from ballooning with the
     // previous turn's internal reasoning (standard practice for reasoning
     // models' chat APIs).
-    const finalContent = renderTurn(false);
+    const finalContent = renderTurn(false, true);
     history.push({ role: "assistant", content: finalContent });
     setStatus("online", "ready");
   } catch (e) {
     if (e.name === "AbortError") {
-      const { content } = splitThinking(accumulated);
+      const { content } = splitThinking(accumulated, true);
       bubble.innerHTML = renderAssistantMarkdown(content + "\n\n*(stopped)*", false);
       history.push({ role: "assistant", content });
     } else {
@@ -533,7 +559,7 @@ inputBox.addEventListener("input", () => {
   inputBox.style.height = Math.min(inputBox.scrollHeight, 200) + "px";
 });
 clearBtn.addEventListener("click", () => {
-  history = [];
+  history = freshHistory();
   messagesEl.innerHTML = "";
   messagesEl.appendChild(emptyState);
   emptyState.style.display = "flex";
