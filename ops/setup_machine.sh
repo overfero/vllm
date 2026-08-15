@@ -253,6 +253,30 @@ stage_vllm() {
     fi
   fi
   log "vllm install verified (compiled kernels import OK)"
+
+  # Real bug hit running this for real (a fresh Kaggle base image, not
+  # seen on every prior box this project has used): the vllm/torch install
+  # above upgrades numpy well past what the base image's PRE-INSTALLED
+  # scikit-learn was compiled against - `ValueError: numpy.dtype size
+  # changed, may indicate binary incompatibility` the moment anything
+  # imports sklearn. We don't use sklearn ourselves; `transformers`
+  # incidentally imports it (generation/candidate_generator.py, itself
+  # only reachable via a lazy AutoConfig/AutoImageProcessor import chain
+  # some checkpoints' config.json trigger) and that's enough to kill
+  # `stage_server.py`/`launch_pp_stage.py` outright before it ever
+  # attempts its PP transport connect - looks like a transport/timing bug
+  # (the other stages just hang waiting for a peer that never comes up)
+  # but isn't. Upgrading scikit-learn to match the now-current numpy fixes
+  # it; harmless no-op if it's already compatible.
+  local sklearn_ok
+  sklearn_ok=$(rssh "python3 -c 'from sklearn.metrics import roc_curve; print(\"SKLEARN_OK\")' 2>&1" || true)
+  if [[ "$sklearn_ok" != *SKLEARN_OK* ]]; then
+    log "scikit-learn is ABI-incompatible with the numpy vllm/torch installed - upgrading..."
+    rssh "pip install --upgrade scikit-learn 2>&1 | tail -15"
+    rssh "python3 -c 'from sklearn.metrics import roc_curve; print(\"scikit-learn/numpy compatible: OK\")'"
+  else
+    log "scikit-learn/numpy already compatible"
+  fi
 }
 
 stage_humming() {
