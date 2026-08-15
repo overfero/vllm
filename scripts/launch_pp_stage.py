@@ -123,6 +123,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "matching flag docstring. Must be passed on every stage + the "
                          "driver together (each stage's local TP group independently "
                          "becomes its EP group; the driver has no special role here).")
+    p.add_argument("--enable-pipelining", action="store_true",
+                    help="Microbatching experiment (2026-08-15) - see "
+                         "vllm/transport/rpc_executor.py's module docstring and "
+                         "stage_server.py's matching flag. Must be passed on every stage "
+                         "+ the driver together, never partially.")
+    p.add_argument("--batch-queue-size", type=int, default=None,
+                    help="Microbatching experiment (2026-08-15), driver-only (this "
+                         "machine's TransportExecutor is the only one running a real, "
+                         "driven Scheduler - see vllm/transport/rpc_executor.py's module "
+                         "docstring for exactly what this mutates and why it's safe for "
+                         "already-spawned local workers). Requires --enable-pipelining "
+                         "too (enforced at runtime in rpc_executor.py, not here). "
+                         "Typically the real cross-machine stage count (--pp-world-size).")
 
     # --- API server (only meaningful on the stage you expose to clients) ---
     p.add_argument("--serve", action="store_true", help="expose the OpenAI-compatible API on this machine")
@@ -196,6 +209,10 @@ def main() -> int:
     env["VLLM_TRANSPORT_TCP_CONNECT_HOST_PREV"] = args.tcp_connect_host_prev or ""
     env["VLLM_TRANSPORT_TCP_CONNECT_HOST_NEXT"] = args.tcp_connect_host_next or ""
     env["VLLM_TRANSPORT_CONNECT_TIMEOUT"] = str(args.transport_connect_timeout)
+    if args.enable_pipelining:
+        env["VLLM_TRANSPORT_ENABLE_PIPELINING"] = "1"
+    if args.batch_queue_size is not None:
+        env["VLLM_TRANSPORT_BATCH_QUEUE_SIZE"] = str(args.batch_queue_size)
     if args.remote_stage_names:
         env["VLLM_TRANSPORT_REMOTE_STAGE_NAMES"] = args.remote_stage_names
         env["VLLM_TRANSPORT_REMOTE_STAGE_HOSTS"] = args.remote_stage_hosts or ""

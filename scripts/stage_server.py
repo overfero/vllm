@@ -197,6 +197,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "Requires num_experts % tensor_parallel_size == 0 (256 % 2 == 0 "
                          "for this model - safe). Off by default; PP3+TP2 remains the "
                          "baseline in cluster/qwen35_122ba10b_3machine.sh.")
+    p.add_argument("--enable-pipelining", action="store_true",
+                    help="Microbatching experiment (2026-08-15) - see "
+                         "vllm/transport/rpc_executor.py's module docstring. Switches "
+                         "this stage's RPC reply loop to the request-id-correlated wire "
+                         "format the driver's pipelined dispatch path needs. Must be "
+                         "passed on every stage + the driver together, never partially - "
+                         "a mismatched pair means one side expects a 3-tuple "
+                         "(method, args, kwargs) and the other sends/expects a 4-tuple "
+                         "(request_id, method, args, kwargs), which fails a pickle-level "
+                         "unpack, not silently. Off by default; does not affect the "
+                         "baseline in cluster/qwen35_122ba10b_3machine.sh at all.")
 
     return p
 
@@ -224,6 +235,8 @@ def _set_transport_env(args: argparse.Namespace) -> None:
     os.environ["VLLM_TRANSPORT_TCP_CONNECT_HOST_PREV"] = args.tcp_connect_host_prev or ""
     os.environ["VLLM_TRANSPORT_TCP_CONNECT_HOST_NEXT"] = args.tcp_connect_host_next or ""
     os.environ["VLLM_TRANSPORT_CONNECT_TIMEOUT"] = str(args.transport_connect_timeout)
+    if args.enable_pipelining:
+        os.environ["VLLM_TRANSPORT_ENABLE_PIPELINING"] = "1"
     # Deliberately NOT setting VLLM_TRANSPORT_REMOTE_STAGE_NAMES - this
     # process's own executor is a plain MultiprocExecutor (see module
     # docstring point 2), not a TransportExecutor; it never forwards.
@@ -290,14 +303,38 @@ def _open_driver_rpc_link(args: argparse.Namespace):
 
 
 def _serve_rpc_loop(transport, model_executor) -> None:
-    print(f"[stage_server] ready - waiting for driver RPC calls on {transport}", file=sys.stderr, flush=True)
+    # 2026-08-15 microbatching experiment: when VLLM_TRANSPORT_ENABLE_PIPELINING=1
+    # (set identically on the driver too - see rpc_executor.py's matching flag),
+    # the wire format on both ends changes: request becomes
+    # (request_id, method, args, kwargs), reply becomes (request_id, status,
+    # payload). The request_id is opaque here - this stage never needs to
+    # interpret it, only echo it straight back - all the correlation logic
+    # lives on the driver side (rpc_executor.py's _reader_loop). This loop
+    # itself STAYS single-threaded/sequential either way: only one GPU
+    # forward pass can actually run at a time on this stage's hardware
+    # regardless of the wire protocol, so there's nothing to gain from
+    # handling requests concurrently here - the pipelining benefit comes
+    # from the DRIVER being able to have step N+1's request already sent
+    # and queued (in the transport's own recv buffer) by the time this loop
+    # finishes step N and calls recv() again, not from this loop doing two
+    # things at once.
+    pipelined = os.environ.get("VLLM_TRANSPORT_ENABLE_PIPELINING") == "1"
+    print(
+        f"[stage_server] ready - waiting for driver RPC calls on {transport} "
+        f"(pipelined={pipelined})",
+        file=sys.stderr, flush=True,
+    )
     while True:
         try:
             raw = transport.recv(timeout=None)
         except (TimeoutError, ConnectionError, OSError) as e:
             print(f"[stage_server] transport closed/errored: {e}", file=sys.stderr, flush=True)
             return
-        method, call_args, call_kwargs = pickle.loads(raw)
+        if pipelined:
+            request_id, method, call_args, call_kwargs = pickle.loads(raw)
+        else:
+            request_id = None
+            method, call_args, call_kwargs = pickle.loads(raw)
         debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
         t0 = time.perf_counter() if debug_timing else 0.0
         try:
@@ -310,7 +347,11 @@ def _serve_rpc_loop(transport, model_executor) -> None:
         if debug_timing:
             print(f"[stage-exec-timing] {method}: {1000*(time.perf_counter()-t0):.1f}ms",
                   flush=True)
-        transport.send(cloudpickle.dumps((status, payload), protocol=pickle.HIGHEST_PROTOCOL))
+        if pipelined:
+            reply = (request_id, status, payload)
+        else:
+            reply = (status, payload)
+        transport.send(cloudpickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def main() -> int:

@@ -47,9 +47,63 @@ Selected via vLLM's own extensibility point, zero vllm core changes:
 (`Executor.get_class`, `vllm/v1/executor/abstract.py`, already resolves
 a dotted qualname string for `distributed_executor_backend` via
 `resolve_obj_by_qualname` - the same mechanism `--worker-cls` uses.)
+
+---
+
+2026-08-15 microbatching (pipeline-bubble-elimination) experiment, OFF by
+default. Two things had to be true together for this to do anything at
+all - doing only one is a no-op or worse:
+
+1. vLLM's own `EngineCore.step_with_batch_queue()` (vllm/v1/engine/core.py)
+   needs `vllm_config.max_concurrent_batches > 1` to even get selected
+   over the plain `step()` this project has used until now - that
+   property reads `parallel_config.pipeline_parallel_size`, which this
+   project's `stage_server.py`/`launch_pp_stage.py` deliberately keep at 1
+   on every machine (the REAL value would make vLLM try to bootstrap a
+   real `torch.distributed` PP group across NAT'd hosts inside
+   `initialize_model_parallel()` - an immediate crash, not a slow
+   timeout). `TransportExecutor._init_executor` below mutates
+   `vllm_config.parallel_config.pipeline_parallel_size` to the real
+   cross-machine stage count, but ONLY AFTER `super()._init_executor()`
+   returns - i.e. only after this machine's own local workers have
+   already spawned and read the (unmutated, correct) value of 1 for
+   their own local-only `initialize_model_parallel()` call. Workers are
+   separate OS processes; a driver-process-only mutation after they've
+   already started never reaches them. Scheduler/KV-cache-manager
+   construction (`EngineCore.__init__`, both happen strictly after
+   `self.model_executor = executor_class(vllm_config)`) then see the
+   mutated value, sizing `max_in_flight_tokens`-driven KV block
+   reservation correctly for genuinely-overlapping batches instead of
+   under-reserving (the latter being exactly the kind of silent
+   KV-slot-collision bug class this project has hit before under a
+   different name - see `_RemoteStageLink`'s docstring below).
+
+2. Even with (1) done, `step_with_batch_queue()` dispatching step N+1's
+   `execute_model`/`sample_tokens` RPCs before step N's replies have
+   arrived is USELESS if `_dispatch_remote` still serializes one full
+   send+recv round trip per link before allowing the next send (which is
+   exactly what the pre-2026-08-15 code below did, deliberately, to close
+   a real crossed-response race - see `_RemoteStageLink`'s docstring).
+   The fix isn't to relax that serialization back to "hope for the
+   best" - it's to give `UDPTransport.recv()`'s shared FIFO queue what it
+   was missing: a request/response correlation id, carried in the
+   payload itself, so a single background reader thread per link can
+   route each arriving reply to the correct pending `Future` regardless
+   of arrival order, with NO assumption that only one request is ever on
+   the wire. This closes the original race at its actual root cause
+   (no way to tell replies apart) instead of working around it by
+   forbidding the concurrency that would trigger it - which is what
+   real pipelining needs.
+
+Both are controlled by `VLLM_TRANSPORT_ENABLE_PIPELINING=1` (new
+correlation-id wire protocol) and `VLLM_TRANSPORT_BATCH_QUEUE_SIZE=N`
+(the mutated `pipeline_parallel_size`) - both env vars, both must be set
+identically on every stage (driver and every `stage_server.py`), never
+partially. See `cluster/qwen35_122ba10b_3machine_pipelined.sh`.
 """
 from __future__ import annotations
 
+import itertools
 import os
 import pickle
 import threading
@@ -71,6 +125,16 @@ _ENV_REMOTE_STAGE_HOSTS = "VLLM_TRANSPORT_REMOTE_STAGE_HOSTS"
 _ENV_RPC_PORT = "VLLM_TRANSPORT_RPC_PORT"
 _ENV_SIGNALING_URL = "VLLM_TRANSPORT_SIGNALING_URL"
 _ENV_CONNECT_TIMEOUT = "VLLM_TRANSPORT_CONNECT_TIMEOUT"
+# 2026-08-15 microbatching experiment (see cluster/qwen35_122ba10b_3machine_pipelined.sh).
+# Both OFF by default - baseline (cluster/qwen35_122ba10b_3machine.sh) never sets
+# these, so it exercises the exact same code path (single-request-in-flight
+# lock, plain 1:1 step()) it always has. Only a deliberately-launched
+# candidate deployment sets them, and BOTH must be set together on every
+# stage (driver AND every stage_server.py) - see module docstring additions
+# below for why pipelining without the batch-queue depth increase (or vice
+# versa) doesn't accomplish anything.
+_ENV_ENABLE_PIPELINING = "VLLM_TRANSPORT_ENABLE_PIPELINING"
+_ENV_BATCH_QUEUE_SIZE = "VLLM_TRANSPORT_BATCH_QUEUE_SIZE"
 
 _DEFAULT_RPC_PORT = 40000
 
@@ -107,10 +171,70 @@ class _RemoteStageLink:
     # each other) so at most one request is ever in flight on the wire at
     # a time, matching stage_server.py's strictly sequential processing and
     # eliminating the crossed-response race entirely.
+    #
+    # 2026-08-15: this lock is still the default (VLLM_TRANSPORT_ENABLE_PIPELINING
+    # unset) and completely unchanged in behavior. When pipelining IS enabled,
+    # `_dispatch_remote` skips this lock entirely and uses `pending`/`reader_thread`
+    # below instead - a request-id-correlated response, which closes the same
+    # race a different way (see module docstring) and additionally allows more
+    # than one request in flight on this link at once, which the lock forbids
+    # by design.
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # --- pipelining-only fields below (unused, stay at their defaults, when
+    # VLLM_TRANSPORT_ENABLE_PIPELINING is unset) ---
+    pipelined: bool = False
+    pending: dict[int, "Future[tuple[str, object]]"] = field(default_factory=dict)
+    pending_lock: threading.Lock = field(default_factory=threading.Lock)
+    id_counter: "itertools.count[int]" = field(default_factory=itertools.count)
+    reader_thread: threading.Thread | None = None
+    reader_stop: threading.Event = field(default_factory=threading.Event)
 
 
-def _connect_remote_stages() -> list[_RemoteStageLink]:
+def _reader_loop(link: _RemoteStageLink) -> None:
+    """Background thread, pipelining mode only: continuously drains this
+    link's transport `recv()` queue and routes each `(request_id, status,
+    result)` reply to the matching pending `Future` by id - regardless of
+    what order replies arrive in, since each one is self-describing now
+    (see module docstring). One thread per link, started once at connect
+    time and left running for the link's whole lifetime; `_dispatch_remote`
+    never calls `transport.recv()` itself in pipelined mode.
+    """
+    while not link.reader_stop.is_set():
+        try:
+            raw = link.transport.recv(timeout=1.0)
+        except TimeoutError:
+            continue
+        except (ConnectionError, OSError) as e:
+            logger.warning("pipelined RPC reader for %s: transport closed (%r)", link.name, e)
+            break
+        try:
+            request_id, status, result = pickle.loads(raw)
+        except Exception:
+            logger.exception(
+                "pipelined RPC reader for %s: failed to unpack reply, dropping", link.name
+            )
+            continue
+        with link.pending_lock:
+            fut = link.pending.pop(request_id, None)
+        if fut is None:
+            logger.warning(
+                "pipelined RPC reader for %s: reply for unknown/already-resolved "
+                "request_id=%s (late timeout retry?), dropping", link.name, request_id
+            )
+            continue
+        if not fut.done():
+            fut.set_result((status, result))
+    # Drain: unblock anything still waiting so callers get a clean error
+    # instead of hanging forever if the link died mid-flight.
+    with link.pending_lock:
+        stale = list(link.pending.items())
+        link.pending.clear()
+    for _request_id, fut in stale:
+        if not fut.done():
+            fut.set_exception(ConnectionError(f"RPC link {link.name!r} reader stopped"))
+
+
+def _connect_remote_stages(pipelined: bool = False) -> list[_RemoteStageLink]:
     """Read `VLLM_TRANSPORT_REMOTE_STAGE_NAMES` (comma-separated, e.g.
     "MachineA,MachineB") and connect one RPC control-channel `Transport`
     to each - the driver always initiates (connects), every
@@ -194,7 +318,15 @@ def _connect_remote_stages() -> list[_RemoteStageLink]:
             )
         )
         logger.info("TransportExecutor: RPC control channel to %s connected", remote_name)
-        links.append(_RemoteStageLink(name=remote_name, transport=transport, timeout=connect_timeout))
+        link = _RemoteStageLink(name=remote_name, transport=transport, timeout=connect_timeout)
+        if pipelined:
+            link.pipelined = True
+            link.reader_thread = threading.Thread(
+                target=_reader_loop, args=(link,),
+                name=f"transport-rpc-reader-{remote_name}", daemon=True,
+            )
+            link.reader_thread.start()
+        links.append(link)
     return links
 
 
@@ -206,8 +338,38 @@ class TransportExecutor(MultiprocExecutor):
     """
 
     def _init_executor(self) -> None:
+        # This call spawns this machine's own local TP workers (they connect
+        # torch.distributed/initialize_model_parallel() with the REAL,
+        # already-1 pipeline_parallel_size their launch command passed in -
+        # see stage_server.py/launch_pp_stage.py's `--pipeline-parallel-size 1`).
+        # The vllm_config mutation below (batch-queue depth trick) happens
+        # AFTER this returns specifically so those already-spawned, separate
+        # OS processes never see it - see module docstring.
         super()._init_executor()
-        self._remote_links: list[_RemoteStageLink] = _connect_remote_stages()
+        pipelined = os.environ.get(_ENV_ENABLE_PIPELINING) == "1"
+        self._remote_links: list[_RemoteStageLink] = _connect_remote_stages(pipelined=pipelined)
+
+        batch_queue_size_raw = os.environ.get(_ENV_BATCH_QUEUE_SIZE)
+        if batch_queue_size_raw:
+            batch_queue_size = int(batch_queue_size_raw)
+            if not pipelined:
+                raise RuntimeError(
+                    f"{_ENV_BATCH_QUEUE_SIZE} is set but {_ENV_ENABLE_PIPELINING} "
+                    "is not - setting a fake pipeline_parallel_size without also "
+                    "switching to the request-id-correlated RPC dispatch just "
+                    "reintroduces the crossed-response race step_with_batch_queue "
+                    "would trigger against the old lock-serialized path. Both or "
+                    "neither."
+                )
+            if batch_queue_size > 1:
+                logger.info(
+                    "TransportExecutor: mutating pipeline_parallel_size 1 -> %d "
+                    "(driver-process-local only, workers already spawned above) "
+                    "so vllm_config.max_concurrent_batches enables "
+                    "step_with_batch_queue - see module docstring.",
+                    batch_queue_size,
+                )
+                self.vllm_config.parallel_config.pipeline_parallel_size = batch_queue_size
         self._rpc_pool: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(
                 max_workers=max(1, len(self._remote_links)),
@@ -235,8 +397,19 @@ class TransportExecutor(MultiprocExecutor):
             if self._remote_links
             else None
         )
+        # 2026-08-15 microbatching fix: serializes local_future.result() calls
+        # across overlapping steps' _combine tasks - see _forward_and_local's
+        # matching comment for the real native crash this closes.
+        self._local_wait_lock = threading.Lock()
 
     def _dispatch_remote(self, link: _RemoteStageLink, method: str, args: tuple, kwargs: dict):
+        if link.pipelined:
+            # Only reached via execute_dummy_batch (rare, not part of the
+            # overlapping-steps hot path _forward_and_local handles
+            # specially below) - fine to block synchronously start-to-finish
+            # here, same net effect as the non-pipelined branch below.
+            reply_future = self._dispatch_remote_pipelined_start(link, method, args, kwargs)
+            return self._resolve_pipelined(link, method, reply_future)
         debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
         t0 = time.perf_counter() if debug_timing else 0.0
         payload = cloudpickle.dumps((method, args, kwargs), protocol=pickle.HIGHEST_PROTOCOL)
@@ -263,33 +436,109 @@ class TransportExecutor(MultiprocExecutor):
             raise RuntimeError(f"remote stage {link.name!r} failed method {method!r}: {result}")
         return result
 
+    def _dispatch_remote_pipelined_start(
+        self, link: _RemoteStageLink, method: str, args: tuple, kwargs: dict
+    ) -> "Future[tuple[str, object]]":
+        """Pipelining-mode dispatch, SEND HALF ONLY: registers a pending
+        Future keyed by a fresh request_id, sends, and returns immediately -
+        does NOT block waiting for the reply. Must never be submitted to
+        `_rpc_pool` and blocked-on there: that pool has exactly
+        `len(remote_links)` workers (correct for the non-pipelined path,
+        where at most one request per link is ever in flight by design -
+        see `_dispatch_remote`'s lock). If this function DID block a pool
+        worker for the full round trip, a second overlapping step's
+        dispatch to the same link would have no worker to run on until the
+        first step's reply arrives - silently reserializing everything
+        `VLLM_TRANSPORT_ENABLE_PIPELINING` was supposed to remove. The
+        actual wait happens in `_forward_and_local`'s `_combine`, which runs
+        in `_combine_pool` (sized for exactly this: multiple steps' worth of
+        concurrent waits, see that pool's own docstring).
+        """
+        request_id = next(link.id_counter)
+        payload = cloudpickle.dumps(
+            (request_id, method, args, kwargs), protocol=pickle.HIGHEST_PROTOCOL
+        )
+        reply_future: "Future[tuple[str, object]]" = Future()
+        with link.pending_lock:
+            link.pending[request_id] = reply_future
+        try:
+            link.transport.send(payload)
+        except Exception:
+            with link.pending_lock:
+                link.pending.pop(request_id, None)
+            raise
+        return reply_future
+
+    def _resolve_pipelined(
+        self, link: _RemoteStageLink, method: str, reply_future: "Future[tuple[str, object]]"
+    ):
+        status, result = reply_future.result(timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
+        if status != _STATUS_OK:
+            raise RuntimeError(f"remote stage {link.name!r} failed method {method!r}: {result}")
+        return result
+
     def _forward_and_local(self, method: str, args: tuple, local_call, non_block: bool):
-        """Fan out `method(*args)` to every remote stage (background
-        threads) while `local_call()` (the real, unmodified local
-        MultiprocExecutor dispatch, always invoked non-blocking) runs
-        concurrently, then wait for both. Only the LOCAL result is
-        returned - matches the fact that only this machine's local
-        workers ever produce a real `ModelRunnerOutput` (a non-last-PP-
-        rank worker returns None, see `gpu_worker.py`'s `execute_model`),
-        so the driver's own result is always the meaningful one.
+        """Fan out `method(*args)` to every remote stage while `local_call()`
+        (the real, unmodified local MultiprocExecutor dispatch, always
+        invoked non-blocking) runs concurrently, then wait for both. Only
+        the LOCAL result is returned - matches the fact that only this
+        machine's local workers ever produce a real `ModelRunnerOutput` (a
+        non-last-PP-rank worker returns None, see `gpu_worker.py`'s
+        `execute_model`), so the driver's own result is always the
+        meaningful one.
+
+        Non-pipelined links: dispatch (send+recv, the full round trip) runs
+        as a blocking call on `_rpc_pool` (one worker per link, matching
+        "at most one request in flight per link" - see `_dispatch_remote`).
+        Pipelined links: only the SEND is done here (fast, not pool-bound);
+        the reply wait happens inside `_combine` below, on `_combine_pool` -
+        see `_dispatch_remote_pipelined_start`'s docstring for why that
+        split matters for genuine multi-step overlap.
         """
         if not self._remote_links:
             return local_call()
 
-        remote_futures = [
-            self._rpc_pool.submit(self._dispatch_remote, link, method, args, {})
-            for link in self._remote_links
-        ]
+        pending: list[tuple[_RemoteStageLink, object, bool]] = []
+        for link in self._remote_links:
+            if link.pipelined:
+                reply_future = self._dispatch_remote_pipelined_start(link, method, args, {})
+                pending.append((link, reply_future, True))
+            else:
+                pool_future = self._rpc_pool.submit(self._dispatch_remote, link, method, args, {})
+                pending.append((link, pool_future, False))
         local_future = local_call()  # local_call itself passes non_block=True
 
         def _combine():
-            for f, link in zip(remote_futures, self._remote_links):
+            for link, fut, pipelined in pending:
                 try:
-                    f.result(timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
+                    if pipelined:
+                        self._resolve_pipelined(link, method, fut)
+                    else:
+                        fut.result(timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
                 except Exception:
                     logger.error("remote stage %s failed during %s", link.name, method)
                     raise
-            return local_future.result()
+            # 2026-08-15 microbatching fix: real crash hit running this for real
+            # ("Bad address (src/fq.cpp:56)", a native libzmq fault - see
+            # vllm/distributed/device_communicators/shm_broadcast.py, which
+            # backs the LOCAL MultiprocExecutor's response path with a ZMQ
+            # XPUB/SpinCondition pair). Root cause: with multiple steps'
+            # `_combine` tasks now genuinely running concurrently on
+            # `_combine_pool` (the whole point of pipelining the REMOTE side),
+            # each one's `local_future.result()` call was ALSO happening
+            # concurrently, from different threads, on the SAME underlying
+            # local MultiprocExecutor response machinery. Real vLLM
+            # `step_with_batch_queue()` never does this even with PP - it
+            # always resolves batch_queue futures one at a time, sequentially,
+            # from the single `run_busy_loop` thread; nothing in
+            # shm_broadcast.py's ZMQ sockets was ever built or tested to be
+            # waited on from multiple threads at once. This lock restores
+            # that "one waiter at a time" invariant for the LOCAL leg only -
+            # remote resolution above (this machine's own pipelined RPC code,
+            # not vLLM's) stays fully concurrent across steps, since that
+            # part was actually designed for it.
+            with self._local_wait_lock:
+                return local_future.result()
 
         combined: Future = self._combine_pool.submit(_combine)
         return combined if non_block else combined.result()
@@ -328,10 +577,14 @@ class TransportExecutor(MultiprocExecutor):
 
     def shutdown(self) -> None:
         for link in getattr(self, "_remote_links", []):
+            if link.pipelined:
+                link.reader_stop.set()
             try:
                 link.transport.close()
             except Exception:
                 logger.warning("error closing RPC link to %s during shutdown", link.name)
+            if link.reader_thread is not None:
+                link.reader_thread.join(timeout=5.0)
         rpc_pool = getattr(self, "_rpc_pool", None)
         if rpc_pool is not None:
             rpc_pool.shutdown(wait=False)
