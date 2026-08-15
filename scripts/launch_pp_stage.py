@@ -118,6 +118,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "see vllm/model_executor/models/qwen3_5_mtp.py's "
                          "get_pp_group().is_last_rank checks. The checkpoint at --model "
                          "must have been extracted with --include-mtp.")
+    p.add_argument("--enable-expert-parallel", action="store_true",
+                    help="PP3+EP2 candidate (2026-08-15 benchmark) - see stage_server.py's "
+                         "matching flag docstring. Must be passed on every stage + the "
+                         "driver together (each stage's local TP group independently "
+                         "becomes its EP group; the driver has no special role here).")
 
     # --- API server (only meaningful on the stage you expose to clients) ---
     p.add_argument("--serve", action="store_true", help="expose the OpenAI-compatible API on this machine")
@@ -257,6 +262,8 @@ def main() -> int:
         cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
     if args.cpu_offload_gb:
         cmd += ["--cpu-offload-gb", str(args.cpu_offload_gb)]
+    if args.enable_expert_parallel:
+        cmd += ["--enable-expert-parallel"]
     if not args.serve:
         # Non-serving stages still need a real engine constructed (to load
         # their shard and connect their transport link(s)) - see the

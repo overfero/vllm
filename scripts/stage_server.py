@@ -185,6 +185,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "consistently, padding should agree stage-to-stage since all PP "
                          "ranks process the same per-step token count. Must be passed on "
                          "every stage + the driver together, never partially.")
+    p.add_argument("--enable-expert-parallel", action="store_true",
+                    help="PP3+EP2 candidate (2026-08-15 benchmark): reuse this stage's "
+                         "local tensor-parallel group (--tensor-parallel-size, real "
+                         "torch.distributed, intra-machine only) to shard MoE routed "
+                         "experts whole-expert-per-rank instead of splitting every "
+                         "expert's matrices in half. Does not touch the cross-machine "
+                         "PP transport at all - vLLM derives the EP group from the same "
+                         "TP group this stage already initializes locally, see "
+                         "vllm/distributed/parallel_state.py's initialize_model_parallel(). "
+                         "Requires num_experts % tensor_parallel_size == 0 (256 % 2 == 0 "
+                         "for this model - safe). Off by default; PP3+TP2 remains the "
+                         "baseline in cluster/qwen35_122ba10b_3machine.sh.")
 
     return p
 
@@ -243,6 +255,7 @@ def _build_engine_core(args: argparse.Namespace):
         language_model_only=args.language_model_only,
         speculative_config=speculative_config,
         enforce_eager=not args.enable_cudagraph,
+        enable_expert_parallel=args.enable_expert_parallel,
         # Disable vLLM's default async scheduling: it makes every non-last PP
         # rank call torch.distributed.broadcast(group=pp.device_group) to pull
         # sampled token ids directly, a second cross-rank channel the synthetic
