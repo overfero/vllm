@@ -92,83 +92,99 @@ set +a
 : "${MACHINE_B_PORT:?.env missing MACHINE_B_PORT}" "${MACHINE_B_PASSWORD:?.env missing MACHINE_B_PASSWORD}"
 : "${MACHINE_C_PORT:?.env missing MACHINE_C_PORT}" "${MACHINE_C_PASSWORD:?.env missing MACHINE_C_PASSWORD}"
 
-# ---- 1. local Machine A (this sandbox, stage 0) ----
-log "=== Machine A (local, stage 0) ==="
+# ---- 1-3. Machine A (local) + B + C environment/checkpoint setup, ALL
+#      RUNNING IN PARALLEL. Real cost hit running this for real: each
+#      stage's setup (torch install, vllm compile, checkpoint download) is
+#      fully independent of the other two until the launch step - running
+#      them one after another on 3 genuinely fresh machines (no cached
+#      torch/vllm/checkpoint) took the SUM of all three setups' time
+#      instead of the MAX, a ~3x slowdown for no reason. Each stage's setup
+#      output goes to its own log file (not the shared terminal stream,
+#      which would otherwise interleave 3 machines' pip/download output
+#      into an unreadable mess) - tail the relevant one if a machine is
+#      slow or fails.
+SIGNALING_URL_FILE="/tmp/.signaling_url_3machine_pipelined"
+rm -f "$SIGNALING_URL_FILE"
 
-local_torch_ver=$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
-if [[ "$local_torch_ver" != "$TORCH_VERSION" ]]; then
-  log "installing torch==$TORCH_VERSION (was: ${local_torch_ver:-none})..."
-  pip install --index-url "$TORCH_INDEX_URL" "torch==$TORCH_VERSION" 2>&1 | tail -20
-else
-  log "torch already at $TORCH_VERSION"
-fi
+setup_machine_a() {
+  log "[A] === Machine A (local, stage 0) ==="
 
-if ! python3 -c 'import torch; import vllm._C_stable_libtorch' >/dev/null 2>&1; then
-  log "installing vllm (VLLM_USE_PRECOMPILED=1)..."
-  pip install setuptools_rust setuptools_scm 2>&1 | tail -5
-  timeout 480 env VLLM_USE_PRECOMPILED=1 pip install -e . --no-build-isolation --no-deps 2>&1 | tail -30
-  timeout 900 env VLLM_USE_PRECOMPILED=1 pip install -e . --no-build-isolation 2>&1 | tail -40
-  python3 -c 'import torch; import vllm._C_stable_libtorch; print("vllm compiled kernels: OK")'
-else
-  log "vllm compiled kernels already OK"
-fi
+  local_torch_ver=$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
+  if [[ "$local_torch_ver" != "$TORCH_VERSION" ]]; then
+    log "[A] installing torch==$TORCH_VERSION (was: ${local_torch_ver:-none})..."
+    pip install --index-url "$TORCH_INDEX_URL" "torch==$TORCH_VERSION" 2>&1 | tail -20
+  else
+    log "[A] torch already at $TORCH_VERSION"
+  fi
 
-if ! python3 -c 'from sklearn.metrics import roc_curve' >/dev/null 2>&1; then
-  log "scikit-learn is ABI-incompatible with the numpy vllm/torch installed - upgrading..."
-  pip install --upgrade scikit-learn 2>&1 | tail -15
-  python3 -c 'from sklearn.metrics import roc_curve; print("scikit-learn/numpy compatible: OK")'
-else
-  log "scikit-learn/numpy already compatible"
-fi
+  if ! python3 -c 'import torch; import vllm._C_stable_libtorch' >/dev/null 2>&1; then
+    log "[A] installing vllm (VLLM_USE_PRECOMPILED=1)..."
+    pip install setuptools_rust setuptools_scm 2>&1 | tail -5
+    timeout 480 env VLLM_USE_PRECOMPILED=1 pip install -e . --no-build-isolation --no-deps 2>&1 | tail -30
+    timeout 900 env VLLM_USE_PRECOMPILED=1 pip install -e . --no-build-isolation 2>&1 | tail -40
+    python3 -c 'import torch; import vllm._C_stable_libtorch; print("vllm compiled kernels: OK")'
+  else
+    log "[A] vllm compiled kernels already OK"
+  fi
 
-if ! python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu' >/dev/null 2>&1; then
-  log "jax is too old for flashinfer/cutlass's optional JAX integration - upgrading..."
-  pip install --upgrade jax 2>&1 | tail -15
-  python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu; print("jax compatible: OK")'
-else
-  log "jax already compatible"
-fi
+  if ! python3 -c 'from sklearn.metrics import roc_curve' >/dev/null 2>&1; then
+    log "[A] scikit-learn is ABI-incompatible with the numpy vllm/torch installed - upgrading..."
+    pip install --upgrade scikit-learn 2>&1 | tail -15
+    python3 -c 'from sklearn.metrics import roc_curve; print("scikit-learn/numpy compatible: OK")'
+  else
+    log "[A] scikit-learn/numpy already compatible"
+  fi
 
-humming_ver=$(pip show humming-kernels 2>/dev/null | grep Version || true)
-if [[ "$humming_ver" != *"$HUMMING_KERNELS_VERSION"* ]]; then
-  log "installing humming-kernels==$HUMMING_KERNELS_VERSION..."
-  pip install "humming-kernels==$HUMMING_KERNELS_VERSION" 2>&1 | tail -10
-else
-  log "humming-kernels already at $HUMMING_KERNELS_VERSION"
-fi
+  if ! python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu' >/dev/null 2>&1; then
+    log "[A] jax is too old for flashinfer/cutlass's optional JAX integration - upgrading..."
+    pip install --upgrade jax 2>&1 | tail -15
+    python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu; print("jax compatible: OK")'
+  else
+    log "[A] jax already compatible"
+  fi
 
-if ! curl -s -m 3 "http://127.0.0.1:${SIGNALING_LOCAL_PORT}/docs" -o /dev/null; then
-  log "starting signaling server on :${SIGNALING_LOCAL_PORT}..."
-  (cd udp_holepunch && nohup python3 -m uvicorn signaling_server:app --host 0.0.0.0 --port "$SIGNALING_LOCAL_PORT" > /tmp/signaling_server.log 2>&1 &)
-  sleep 3
-  curl -s -m 5 "http://127.0.0.1:${SIGNALING_LOCAL_PORT}/docs" -o /dev/null && log "signaling server up" || { log "ERROR: signaling server failed to start, check /tmp/signaling_server.log"; exit 1; }
-else
-  log "signaling server already running"
-fi
+  humming_ver=$(pip show humming-kernels 2>/dev/null | grep Version || true)
+  if [[ "$humming_ver" != *"$HUMMING_KERNELS_VERSION"* ]]; then
+    log "[A] installing humming-kernels==$HUMMING_KERNELS_VERSION..."
+    pip install "humming-kernels==$HUMMING_KERNELS_VERSION" 2>&1 | tail -10
+  else
+    log "[A] humming-kernels already at $HUMMING_KERNELS_VERSION"
+  fi
 
-if ! pgrep -f "zrok2 share public http://127.0.0.1:${SIGNALING_LOCAL_PORT}" > /dev/null; then
-  log "starting public zrok tunnel for signaling server..."
-  nohup zrok2 share public "http://127.0.0.1:${SIGNALING_LOCAL_PORT}" --headless > /tmp/zrok_signaling.log 2>&1 &
-  sleep 8
-fi
-SIGNALING_URL=$(grep -oE 'https://[a-z0-9]+\.share\.zrok\.io' /tmp/zrok_signaling.log | tail -1)
-if [[ -z "$SIGNALING_URL" ]]; then
-  log "ERROR: could not determine public signaling URL from /tmp/zrok_signaling.log"
-  exit 1
-fi
-log "signaling URL: $SIGNALING_URL"
-curl -s -m 10 "$SIGNALING_URL/docs" -o /dev/null -w "[3machine-pipelined] public signaling URL check: HTTP %{http_code}\n" || true
+  if ! curl -s -m 3 "http://127.0.0.1:${SIGNALING_LOCAL_PORT}/docs" -o /dev/null; then
+    log "[A] starting signaling server on :${SIGNALING_LOCAL_PORT}..."
+    (cd udp_holepunch && nohup python3 -m uvicorn signaling_server:app --host 0.0.0.0 --port "$SIGNALING_LOCAL_PORT" > /tmp/signaling_server.log 2>&1 &)
+    sleep 3
+    curl -s -m 5 "http://127.0.0.1:${SIGNALING_LOCAL_PORT}/docs" -o /dev/null && log "[A] signaling server up" || { log "[A] ERROR: signaling server failed to start, check /tmp/signaling_server.log"; exit 1; }
+  else
+    log "[A] signaling server already running"
+  fi
 
-if [[ ! -f /data/stage0-checkpoint/model.safetensors.index.json ]]; then
-  log "stage0-checkpoint missing, selectively downloading + extracting (layers 0-15 + globals)..."
-  mkdir -p /data/models
-  (cd humming_fix/single_layer_probe && python3 download_and_extract_qwen35_stage.py --start 0 --end 16 --out /data/stage0-checkpoint --checkpoint-dir "$CHECKPOINT_DIR" --include-globals 2>&1 | tail -40)
-  log "stage0-checkpoint ready, downloaded shards deleted"
-else
-  log "stage0-checkpoint already present"
-fi
+  if ! pgrep -f "zrok2 share public http://127.0.0.1:${SIGNALING_LOCAL_PORT}" > /dev/null; then
+    log "[A] starting public zrok tunnel for signaling server..."
+    nohup zrok2 share public "http://127.0.0.1:${SIGNALING_LOCAL_PORT}" --headless > /tmp/zrok_signaling.log 2>&1 &
+    sleep 8
+  fi
+  local signaling_url
+  signaling_url=$(grep -oE 'https://[a-z0-9]+\.share\.zrok\.io' /tmp/zrok_signaling.log | tail -1)
+  if [[ -z "$signaling_url" ]]; then
+    log "[A] ERROR: could not determine public signaling URL from /tmp/zrok_signaling.log"
+    exit 1
+  fi
+  echo "$signaling_url" > "$SIGNALING_URL_FILE"
+  log "[A] signaling URL: $signaling_url"
+  curl -s -m 10 "$signaling_url/docs" -o /dev/null -w "[3machine-pipelined] [A] public signaling URL check: HTTP %{http_code}\n" || true
 
-# ---- 2-3. remote machines B, C (same checkpoints as baseline - shared) ----
+  if [[ ! -f /data/stage0-checkpoint/model.safetensors.index.json ]]; then
+    log "[A] stage0-checkpoint missing, selectively downloading + extracting (layers 0-15 + globals)..."
+    mkdir -p /data/models
+    (cd humming_fix/single_layer_probe && python3 download_and_extract_qwen35_stage.py --start 0 --end 16 --out /data/stage0-checkpoint --checkpoint-dir "$CHECKPOINT_DIR" --include-globals 2>&1 | tail -40)
+    log "[A] stage0-checkpoint ready, downloaded shards deleted"
+  else
+    log "[A] stage0-checkpoint already present"
+  fi
+}
+
 deploy_remote_stage() {
   local name="$1" port="$2" password="$3" start="$4" end="$5" out="$6" extra="${7:-}"
   log "=== $name (remote, layers [$start,$end)) ==="
@@ -185,10 +201,34 @@ deploy_remote_stage() {
     "rm -rf $CHECKPOINT_DIR" 2>/dev/null || true
 }
 
-deploy_remote_stage "MachineB" "$MACHINE_B_PORT" "$MACHINE_B_PASSWORD" 16 32 /data/stage1-checkpoint
-deploy_remote_stage "MachineC" "$MACHINE_C_PORT" "$MACHINE_C_PASSWORD" 32 48 /data/stage2-checkpoint ":globals"
+SETUP_LOG_A="/tmp/setup_A_3machine_pipelined.log"
+SETUP_LOG_B="/tmp/setup_B_3machine_pipelined.log"
+SETUP_LOG_C="/tmp/setup_C_3machine_pipelined.log"
 
-log "=== all 3 machines' environments + checkpoints ready ==="
+setup_machine_a > "$SETUP_LOG_A" 2>&1 &
+PID_A=$!
+deploy_remote_stage "MachineB" "$MACHINE_B_PORT" "$MACHINE_B_PASSWORD" 16 32 /data/stage1-checkpoint > "$SETUP_LOG_B" 2>&1 &
+PID_B=$!
+deploy_remote_stage "MachineC" "$MACHINE_C_PORT" "$MACHINE_C_PASSWORD" 32 48 /data/stage2-checkpoint ":globals" > "$SETUP_LOG_C" 2>&1 &
+PID_C=$!
+
+log "waiting for all 3 machines' setup to finish in parallel (logs: $SETUP_LOG_A, $SETUP_LOG_B, $SETUP_LOG_C)..."
+SETUP_FAILED=0
+wait "$PID_A" || { log "ERROR: Machine A setup failed - see $SETUP_LOG_A"; SETUP_FAILED=1; }
+wait "$PID_B" || { log "ERROR: Machine B setup failed - see $SETUP_LOG_B"; SETUP_FAILED=1; }
+wait "$PID_C" || { log "ERROR: Machine C setup failed - see $SETUP_LOG_C"; SETUP_FAILED=1; }
+if [[ "$SETUP_FAILED" -ne 0 ]]; then
+  log "ERROR: one or more machines' setup failed, aborting"
+  exit 1
+fi
+
+if [[ ! -f "$SIGNALING_URL_FILE" ]]; then
+  log "ERROR: Machine A's setup didn't produce a signaling URL - see $SETUP_LOG_A"
+  exit 1
+fi
+SIGNALING_URL=$(cat "$SIGNALING_URL_FILE")
+
+log "=== all 3 machines' environments + checkpoints ready (parallel setup, signaling URL: $SIGNALING_URL) ==="
 
 # ---- 4. clean up ANY running deployment (baseline OR a stale candidate
 #      run) - PP3+TP2 and this candidate cannot coexist on the same 6 GPUs. ----
