@@ -112,6 +112,35 @@
   th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; font-size: 13px; }
   th { background: var(--bg-secondary); }
 
+  .thinking-block {
+    margin-bottom: 10px; border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; background: rgba(255,255,255,0.02);
+  }
+  .thinking-toggle {
+    width: 100%; display: flex; align-items: center; gap: 8px;
+    background: transparent; border: none; color: var(--text-dim);
+    padding: 9px 12px; cursor: pointer; font-size: 13px; text-align: left;
+  }
+  .thinking-toggle:hover { color: var(--text); }
+  .thinking-toggle .chevron { transition: transform 0.2s; font-size: 11px; }
+  .thinking-block.collapsed .thinking-toggle .chevron { transform: rotate(-90deg); }
+  .thinking-toggle .pulse {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+  .thinking-body {
+    padding: 0 14px 12px 14px; font-size: 13px; line-height: 1.55;
+    color: var(--text-dim); font-style: italic;
+    border-top: 1px solid var(--border);
+    max-height: 1000px; overflow: hidden; transition: max-height 0.25s ease, padding 0.25s ease;
+  }
+  .thinking-block.collapsed .thinking-body {
+    max-height: 0; padding-top: 0; padding-bottom: 0; border-top: none;
+  }
+  .thinking-body p { margin: 10px 0 0 0; }
+  .thinking-body pre code { font-style: normal; }
+
   .cursor-blink {
     display: inline-block; width: 8px; height: 1em; background: var(--text);
     vertical-align: text-bottom; margin-left: 2px;
@@ -277,6 +306,30 @@ function renderAssistantMarkdown(rawText, showCursor) {
   return html;
 }
 
+// ---------- <think>...</think> splitting ----------
+// Streaming-safe: while <think> has opened but </think> hasn't arrived
+// yet, everything after the open tag is "still thinking" and goes in the
+// collapsible block; once the close tag lands, the block is finalized and
+// everything after it renders as the normal answer. Some responses never
+// use the tag at all (this checkpoint's own reasoning style is often
+// plain "Thinking Process:" prose with no tag - see chat with the user
+// about this) - those just fall through untouched as regular content.
+function splitThinking(text) {
+  const openIdx = text.indexOf("<think>");
+  if (openIdx === -1) {
+    return { thinking: null, thinkingDone: true, content: text };
+  }
+  const before = text.slice(0, openIdx);
+  const afterOpen = text.slice(openIdx + "<think>".length);
+  const closeIdx = afterOpen.indexOf("</think>");
+  if (closeIdx === -1) {
+    return { thinking: afterOpen, thinkingDone: false, content: before };
+  }
+  const thinking = afterOpen.slice(0, closeIdx);
+  const rest = afterOpen.slice(closeIdx + "</think>".length).replace(/^\n+/, "");
+  return { thinking, thinkingDone: true, content: before + rest };
+}
+
 function decorateCodeBlocks(container) {
   container.querySelectorAll("pre code").forEach((block) => {
     if (block.dataset.decorated) return;
@@ -325,12 +378,31 @@ function addAssistantMessage() {
     <div class="msg-inner">
       <div class="avatar-row">
         <div class="avatar">Q</div>
-        <div class="assistant-content"><div class="bubble assistant"></div></div>
+        <div class="assistant-content">
+          <div class="thinking-block" style="display:none">
+            <button class="thinking-toggle" type="button">
+              <span class="chevron">&#9662;</span>
+              <span class="pulse"></span>
+              <span class="thinking-label">Thinking</span>
+            </button>
+            <div class="thinking-body"><div class="thinking-md"></div></div>
+          </div>
+          <div class="bubble assistant"></div>
+        </div>
       </div>
     </div>`;
   messagesEl.appendChild(row);
+  const thinkingBlock = row.querySelector(".thinking-block");
+  const toggle = row.querySelector(".thinking-toggle");
+  toggle.addEventListener("click", () => thinkingBlock.classList.toggle("collapsed"));
   scrollToBottom();
-  return row.querySelector(".bubble.assistant");
+  return {
+    bubble: row.querySelector(".bubble.assistant"),
+    thinkingBlock,
+    thinkingMd: row.querySelector(".thinking-md"),
+    thinkingLabel: row.querySelector(".thinking-label"),
+    pulse: row.querySelector(".pulse"),
+  };
 }
 
 function setStatus(state, text) {
@@ -347,12 +419,34 @@ async function sendMessage() {
   history.push({ role: "user", content: text });
   addUserMessage(text);
 
-  const bubble = addAssistantMessage();
+  const { bubble, thinkingBlock, thinkingMd, thinkingLabel, pulse } = addAssistantMessage();
   let accumulated = "";
+  let thinkStartedAt = null;
   streaming = true;
   sendBtn.textContent = "■";
   sendBtn.classList.add("stop");
   abortController = new AbortController();
+
+  function renderTurn(showCursor) {
+    const { thinking, thinkingDone, content } = splitThinking(accumulated);
+    if (thinking !== null) {
+      thinkingBlock.style.display = "block";
+      if (thinkStartedAt === null) thinkStartedAt = performance.now();
+      thinkingMd.innerHTML = renderAssistantMarkdown(thinking, showCursor && !thinkingDone);
+      decorateCodeBlocks(thinkingMd);
+      if (thinkingDone) {
+        pulse.style.display = "none";
+        const secs = ((performance.now() - thinkStartedAt) / 1000).toFixed(1);
+        thinkingLabel.textContent = `Thought for ${secs}s`;
+      } else {
+        pulse.style.display = "inline-block";
+        thinkingLabel.textContent = "Thinking";
+      }
+    }
+    bubble.innerHTML = renderAssistantMarkdown(content, showCursor && (thinking === null || thinkingDone));
+    decorateCodeBlocks(bubble);
+    return content;
+  }
 
   try {
     const resp = await fetch(API_BASE + "/v1/chat/completions", {
@@ -390,21 +484,24 @@ async function sendMessage() {
           const delta = obj.choices?.[0]?.delta?.content;
           if (delta) {
             accumulated += delta;
-            bubble.innerHTML = renderAssistantMarkdown(accumulated, true);
-            decorateCodeBlocks(bubble);
+            renderTurn(true);
             scrollToBottom();
           }
         } catch (e) { /* partial JSON line, ignore */ }
       }
     }
-    bubble.innerHTML = renderAssistantMarkdown(accumulated, false);
-    decorateCodeBlocks(bubble);
-    history.push({ role: "assistant", content: accumulated });
+    // Conversation history only ever gets the final answer, never the
+    // <think> block - keeps multi-turn context from ballooning with the
+    // previous turn's internal reasoning (standard practice for reasoning
+    // models' chat APIs).
+    const finalContent = renderTurn(false);
+    history.push({ role: "assistant", content: finalContent });
     setStatus("online", "ready");
   } catch (e) {
     if (e.name === "AbortError") {
-      bubble.innerHTML = renderAssistantMarkdown(accumulated + "\n\n*(stopped)*", false);
-      history.push({ role: "assistant", content: accumulated });
+      const { content } = splitThinking(accumulated);
+      bubble.innerHTML = renderAssistantMarkdown(content + "\n\n*(stopped)*", false);
+      history.push({ role: "assistant", content });
     } else {
       bubble.innerHTML = renderAssistantMarkdown(accumulated || "", false) +
         `<div style="color:#e05252; margin-top:8px;">Error: ${e.message}</div>`;
