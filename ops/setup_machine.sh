@@ -224,9 +224,44 @@ stage_vllm() {
   # `ModuleNotFoundError: No module named 'cbor2'` at first real use, long
   # after this stage had already reported success.
   stage_so
+  # Real bug hit running this for real (2026-08-15, fresh machine, first
+  # time this project ever deployed to a genuinely brand-new pair of
+  # remote machines instead of ones with years of accumulated local
+  # state): the dummy-wheel trick above makes setup.py's wheel-extraction
+  # step a no-op (empty zip, zero members) - which also means it never
+  # extracts vllm/third_party/flashmla/flash_mla_interface.py, a real
+  # Python source file setup.py normally pulls out of the genuine
+  # precompiled wheel (see setup.py's flashmla_regex) and that .gitignore
+  # deliberately excludes from the repo (it's wheel-bundled, not
+  # source-tracked). This machine never gets it, and vLLM's own
+  # get_quantization_config() eagerly imports vllm.models.deepseek_v4
+  # (unconditionally, regardless of which quantization method is actually
+  # requested - real upstream behavior, not this project's own code),
+  # which chains into this file - `ModuleNotFoundError` crashes the API
+  # server / stage_server.py the moment ANY quantization config is
+  # resolved, GPTQ included, nothing to do with DeepSeek. A machine that
+  # got the real (non-dummy) wheel at some point in its history - like
+  # this project's own long-lived local sandbox - never hits this,
+  # which is why it went unnoticed until a truly fresh remote machine
+  # was used. Fix: copy this machine's own local copy over directly, the
+  # same pattern stage_so already uses for .so files - only meaningful if
+  # the local machine actually has one (itself only true if ITS install
+  # got a real wheel rather than the dummy; harmless no-op warning
+  # otherwise, same as stage_so's own missing-file handling).
   rssh "python3 -c \"import zipfile; zipfile.ZipFile('/tmp/dummy_vllm_wheel.whl', 'w').close()\""
   rssh "timeout 480 env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/dummy_vllm_wheel.whl pip install -e . --no-build-isolation --no-deps 2>&1 | tail -30"
   rssh "timeout 900 env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/dummy_vllm_wheel.whl pip install -e . --no-build-isolation 2>&1 | tail -40"
+  # Copy AFTER both pip install calls above, not before - the dummy-wheel
+  # extraction step touches this same directory (even though it extracts
+  # zero real members), so copying first risked it getting clobbered.
+  local flashmla_py="vllm/third_party/flashmla/flash_mla_interface.py"
+  if [[ -f "$LOCAL_ROOT/$flashmla_py" ]]; then
+    sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no -P "$PORT" \
+      "$LOCAL_ROOT/$flashmla_py" "root@127.0.0.1:$REMOTE_PROJECT_ROOT/$flashmla_py" \
+      || log "WARNING: failed to copy $flashmla_py"
+  else
+    log "WARNING: $flashmla_py not present locally either - remote will hit the same ModuleNotFoundError on first quantization-config resolution. Run this project's install once on a machine that gets a real (non-dummy) precompiled wheel first, then re-run this stage."
+  fi
   local ok
   ok=$(rssh "python3 -c 'import torch; import vllm._C_stable_libtorch; print(\"COMPILED_KERNELS_OK\")' 2>&1" || true)
   if [[ "$ok" != *COMPILED_KERNELS_OK* ]]; then
