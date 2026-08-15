@@ -136,6 +136,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "already-spawned local workers). Requires --enable-pipelining "
                          "too (enforced at runtime in rpc_executor.py, not here). "
                          "Typically the real cross-machine stage count (--pp-world-size).")
+    p.add_argument("--enable-rpc-fusion", action="store_true",
+                    help="RPC fusion (2026-08-15), on top of --enable-pipelining: "
+                         "combines a step's execute_model+sample_tokens into ONE RPC "
+                         "round trip per remote link instead of two (see "
+                         "rpc_executor.py's _forward_and_local_fused). Must be passed "
+                         "on every stage + the driver together (needs "
+                         "--enable-pipelining on all of them too).")
 
     # --- API server (only meaningful on the stage you expose to clients) ---
     p.add_argument("--serve", action="store_true", help="expose the OpenAI-compatible API on this machine")
@@ -213,6 +220,8 @@ def main() -> int:
         env["VLLM_TRANSPORT_ENABLE_PIPELINING"] = "1"
     if args.batch_queue_size is not None:
         env["VLLM_TRANSPORT_BATCH_QUEUE_SIZE"] = str(args.batch_queue_size)
+    if args.enable_rpc_fusion:
+        env["VLLM_TRANSPORT_ENABLE_RPC_FUSION"] = "1"
     if args.remote_stage_names:
         env["VLLM_TRANSPORT_REMOTE_STAGE_NAMES"] = args.remote_stage_names
         env["VLLM_TRANSPORT_REMOTE_STAGE_HOSTS"] = args.remote_stage_hosts or ""

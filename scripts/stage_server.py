@@ -338,8 +338,28 @@ def _serve_rpc_loop(transport, model_executor) -> None:
         debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
         t0 = time.perf_counter() if debug_timing else 0.0
         try:
-            fn = getattr(model_executor, method)
-            result = fn(*call_args, **call_kwargs)
+            if method == "execute_model_and_sample_tokens":
+                # 2026-08-15 RPC fusion (only meaningful with pipelined=True -
+                # see rpc_executor.py's matching driver-side change): one
+                # round trip instead of two for a single step's
+                # execute_model+sample_tokens pair. Not a real
+                # model_executor method - handled here directly rather than
+                # via getattr, since MultiprocExecutor has no such method
+                # itself. Safe to run back-to-back with no wait in between:
+                # this stage's own model_executor.execute_model() already
+                # blocks (synchronously, within this call) until this
+                # stage's local forward pass + PP tensor send/recv is done,
+                # so sample_tokens() right after always sees a completed
+                # execute_model_state - exactly the same ordering as if the
+                # driver had sent two separate requests and waited for the
+                # first to finish before sending the second, just without
+                # the network round trip in between.
+                scheduler_output, grammar_output = call_args
+                model_executor.execute_model(scheduler_output)
+                result = model_executor.sample_tokens(grammar_output)
+            else:
+                fn = getattr(model_executor, method)
+                result = fn(*call_args, **call_kwargs)
             status, payload = _STATUS_OK, result
         except Exception as e:  # noqa: BLE001 - report to driver, don't crash the stage
             print(f"[stage_server] method {method!r} raised: {e!r}", file=sys.stderr, flush=True)

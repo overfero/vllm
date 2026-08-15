@@ -53,7 +53,29 @@ SIGNALING_LOCAL_PORT=8765
 DRIVER_PORT=8080
 MAX_MODEL_LEN=8192
 GPU_MEM_UTIL=0.95
-NUM_GPU_BLOCKS_OVERRIDE=60
+# 2026-08-15 reliability fix: this MUST be identical across all 3 machines
+# (see rpc_executor.py's module docstring - scheduler_output block-table ids
+# only mean the same thing if every stage sized its KV cache identically),
+# but real per-machine safe capacity (vLLM's own profiler, BEFORE this
+# override was applied) differs a lot - measured for real running this
+# exact deployment: Machine A auto-computed 182 blocks safe, Machine B 127,
+# Machine C only 37 (holds lm_head/norm as the last stage + the API server +
+# RPC executor's extra threads/python state on top of the same 16 real
+# layers A/B also carry - real, structural, not just noise). The old value
+# here (60) was ABOVE Machine C's own auto-computed safe threshold - it was
+# working in practice (real headroom observed while serving, no OOM hit),
+# but riding above what vLLM's own profiler considers safe is a genuine
+# latent OOM risk under peak conditions (e.g. a burst of concurrent
+# near-max-length requests, or CUDA graph capture's own transient overhead)
+# that just hadn't been triggered yet. 35 leaves Machine C a small margin
+# below its own measured 37-block ceiling. Trade-off: total KV cache
+# capacity drops from ~70k tokens (60 blocks, supports max_num_seqs=8 at
+# full 8192-token requests, 8.57x concurrency headroom) to ~41k tokens (35
+# blocks, ~5x concurrency headroom at full length) - fewer concurrent
+# full-length requests fit, in exchange for the tightest machine no longer
+# running above its own safe threshold. Revisit if this project ever
+# rebalances layers away from Machine C to reclaim its headroom instead.
+NUM_GPU_BLOCKS_OVERRIDE=35
 MAX_NUM_SEQS=8
 BATCH_QUEUE_SIZE=3
 
@@ -211,7 +233,7 @@ sshpass -p "$MACHINE_C_PASSWORD" ssh -o StrictHostKeyChecking=no -p "$MACHINE_C_
   --model /data/stage2-checkpoint --tensor-parallel-size 2 --dtype float16 --quantization gptq \
   --gpu-memory-utilization $GPU_MEM_UTIL --language-model-only --max-model-len $MAX_MODEL_LEN \
   --num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE --max-num-seqs $MAX_NUM_SEQS --enable-cudagraph \
-  --enable-pipelining --batch-queue-size $BATCH_QUEUE_SIZE \
+  --enable-pipelining --batch-queue-size $BATCH_QUEUE_SIZE --enable-rpc-fusion \
   --serve --host 0.0.0.0 --port $DRIVER_PORT --remote-stage-names MachineA,MachineB \
   > /kaggle/working/vllm/deploy_C_pipelined.log 2>&1 < /dev/null & disown; echo launched" &
 

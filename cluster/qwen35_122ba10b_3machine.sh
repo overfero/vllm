@@ -51,7 +51,17 @@ SIGNALING_LOCAL_PORT=8765
 DRIVER_PORT=8080
 MAX_MODEL_LEN=8192
 GPU_MEM_UTIL=0.95
-NUM_GPU_BLOCKS_OVERRIDE=60
+# 2026-08-15 reliability fix (measured running the microbatching candidate,
+# same 16/16/16 layer split and checkpoints as this script - see
+# cluster/qwen35_122ba10b_3machine_pipelined.sh's matching comment for the
+# full real numbers): Machine C's own vLLM profiler only auto-computed 37
+# blocks as safe (holds lm_head/norm + the API server on top of the same
+# real layers A/B carry), well under the old uniform 60 this script forced
+# on every machine. 35 leaves a small margin under that. Lowers total KV
+# cache capacity (~70k -> ~41k tokens, max_num_seqs=8 concurrency headroom
+# at full 8192-token requests drops from 8.57x to ~5x) in exchange for
+# Machine C no longer running above its own measured-safe threshold.
+NUM_GPU_BLOCKS_OVERRIDE=35
 MAX_NUM_SEQS=8
 
 log() { echo "[3machine] $*" >&2; }

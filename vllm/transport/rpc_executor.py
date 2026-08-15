@@ -103,6 +103,7 @@ partially. See `cluster/qwen35_122ba10b_3machine_pipelined.sh`.
 """
 from __future__ import annotations
 
+import collections
 import itertools
 import os
 import pickle
@@ -135,6 +136,13 @@ _ENV_CONNECT_TIMEOUT = "VLLM_TRANSPORT_CONNECT_TIMEOUT"
 # versa) doesn't accomplish anything.
 _ENV_ENABLE_PIPELINING = "VLLM_TRANSPORT_ENABLE_PIPELINING"
 _ENV_BATCH_QUEUE_SIZE = "VLLM_TRANSPORT_BATCH_QUEUE_SIZE"
+# 2026-08-15 RPC fusion: only meaningful (and only allowed) on top of
+# pipelining - see TransportExecutor.execute_model/sample_tokens. Fuses a
+# single step's execute_model+sample_tokens into ONE round trip per remote
+# link (stage_server.py's execute_model_and_sample_tokens handler) instead
+# of two. Independent toggle from pipelining itself so each can be
+# benchmarked/rolled back separately.
+_ENV_ENABLE_FUSION = "VLLM_TRANSPORT_ENABLE_RPC_FUSION"
 
 _DEFAULT_RPC_PORT = 40000
 
@@ -348,6 +356,25 @@ class TransportExecutor(MultiprocExecutor):
         super()._init_executor()
         pipelined = os.environ.get(_ENV_ENABLE_PIPELINING) == "1"
         self._remote_links: list[_RemoteStageLink] = _connect_remote_stages(pipelined=pipelined)
+        self._fusion_enabled = pipelined and os.environ.get(_ENV_ENABLE_FUSION) == "1"
+        if os.environ.get(_ENV_ENABLE_FUSION) == "1" and not pipelined:
+            raise RuntimeError(
+                f"{_ENV_ENABLE_FUSION} is set but {_ENV_ENABLE_PIPELINING} is not - "
+                "fusion reuses the pipelined request-id-correlated dispatch path, "
+                "it cannot run against the old lock-serialized one."
+            )
+        # request_id-agnostic here (each is a fresh id from the link's own
+        # id_counter, assigned when the fused RPC actually goes out in
+        # sample_tokens() below) - this only tracks the deferred
+        # scheduler_output itself, one deque per link, FIFO. Safe without
+        # a lock for push/pop ordering: execute_model()/sample_tokens() are
+        # always called from EngineCore's single busy-loop thread, never
+        # concurrently with each other - only the deque's use.
+        self._pending_fusion: dict[str, "collections.deque"] = (
+            {link.name: collections.deque() for link in self._remote_links}
+            if self._fusion_enabled
+            else {}
+        )
 
         batch_queue_size_raw = os.environ.get(_ENV_BATCH_QUEUE_SIZE)
         if batch_queue_size_raw:
@@ -544,6 +571,33 @@ class TransportExecutor(MultiprocExecutor):
         return combined if non_block else combined.result()
 
     def execute_model(self, scheduler_output, non_block: bool = False):
+        # 2026-08-15 microbatching perf fix: real regression measured running
+        # this for real (single request, batch_queue_size=3: ~58-70% SLOWER
+        # decode wall-clock than the old 1:1 step() baseline, not faster).
+        # Root cause: step_with_batch_queue() keeps calling schedule() +
+        # dispatching execute_model in a tight loop (no wait) until
+        # len(batch_queue) == batch_queue_size, and the scheduler "may
+        # return an empty batch if all requests are scheduled" (its own
+        # docstring) - with only 1 real request in flight, 2 of every 3
+        # dispatched steps have total_num_scheduled_tokens == 0, yet were
+        # still getting a full RPC round trip to EVERY remote link for
+        # nothing. Skip the remote fan-out entirely for a genuinely empty
+        # schedule - local_call() below is equally a no-op for one, so
+        # there is nothing remote stages need to be told about this step at
+        # all (no PP tensor exchange happens for zero scheduled tokens
+        # either). Only helps this specific waste; a real multi-request
+        # workload that keeps the batch queue genuinely full end-to-end
+        # would rarely hit this branch.
+        if getattr(scheduler_output, "total_num_scheduled_tokens", 1) == 0:
+            return super(TransportExecutor, self).execute_model(scheduler_output, non_block=non_block)
+        if self._fusion_enabled:
+            # Defer the remote half entirely - sample_tokens() below sends
+            # ONE fused request per link instead of this method sending one
+            # and sample_tokens() sending a second. Local dispatch is
+            # unaffected (not part of remote RPC at all).
+            for link in self._remote_links:
+                self._pending_fusion[link.name].append(scheduler_output)
+            return super(TransportExecutor, self).execute_model(scheduler_output, non_block=non_block)
         return self._forward_and_local(
             "execute_model",
             (scheduler_output,),
@@ -552,12 +606,56 @@ class TransportExecutor(MultiprocExecutor):
         )
 
     def sample_tokens(self, grammar_output, non_block: bool = False):
+        if self._fusion_enabled:
+            return self._forward_and_local_fused(grammar_output, non_block)
         return self._forward_and_local(
             "sample_tokens",
             (grammar_output,),
             lambda: super(TransportExecutor, self).sample_tokens(grammar_output, non_block=True),
             non_block,
         )
+
+    def _forward_and_local_fused(self, grammar_output, non_block: bool):
+        """RPC-fusion dispatch: pairs each remote link's deferred
+        `execute_model` scheduler_output (stashed by `execute_model()`
+        above) with this `sample_tokens` call's `grammar_output`, sending
+        BOTH as one `execute_model_and_sample_tokens` request per link -
+        see stage_server.py's matching handler. Falls back to a plain
+        sample_tokens-only dispatch for a link with nothing queued (e.g.
+        its paired execute_model hit the empty-batch fast path above and
+        never deferred anything)."""
+        if not self._remote_links:
+            return super(TransportExecutor, self).sample_tokens(grammar_output, non_block=non_block)
+
+        pending: list[tuple[_RemoteStageLink, "Future[tuple[str, object]]", str]] = []
+        for link in self._remote_links:
+            queue = self._pending_fusion[link.name]
+            if queue:
+                scheduler_output = queue.popleft()
+                method = "execute_model_and_sample_tokens"
+                reply_future = self._dispatch_remote_pipelined_start(
+                    link, method, (scheduler_output, grammar_output), {}
+                )
+            else:
+                method = "sample_tokens"
+                reply_future = self._dispatch_remote_pipelined_start(
+                    link, method, (grammar_output,), {}
+                )
+            pending.append((link, reply_future, method))
+        local_future = super(TransportExecutor, self).sample_tokens(grammar_output, non_block=True)
+
+        def _combine():
+            for link, fut, method in pending:
+                try:
+                    self._resolve_pipelined(link, method, fut)
+                except Exception:
+                    logger.error("remote stage %s failed during %s", link.name, method)
+                    raise
+            with self._local_wait_lock:
+                return local_future.result()
+
+        combined: Future = self._combine_pool.submit(_combine)
+        return combined if non_block else combined.result()
 
     def execute_dummy_batch(self) -> None:
         if not self._remote_links:
