@@ -277,6 +277,26 @@ stage_vllm() {
   else
     log "scikit-learn/numpy already compatible"
   fi
+
+  # Same class of bug, same fresh-image root cause: vLLM's cuda_communicator
+  # unconditionally imports flashinfer (for a CUSTOM_ALLREDUCE path, not
+  # actually load-bearing for our TP=2/T4 setup, but imported eagerly
+  # regardless), which chains into nvidia_cutlass_dsl's optional JAX
+  # integration - and the base image's pre-installed jax predates
+  # `jax.numpy.float8_e8m0fnu`, so importing it raises
+  # `AttributeError: module 'jax.numpy' has no attribute 'float8_e8m0fnu'`
+  # and kills the worker process during distributed-group init, again
+  # before the PP transport connect is ever attempted. Upgrading jax fixes
+  # it; harmless no-op if already compatible.
+  local jax_ok
+  jax_ok=$(rssh "python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu; print(\"JAX_OK\")' 2>&1" || true)
+  if [[ "$jax_ok" != *JAX_OK* ]]; then
+    log "jax is too old for flashinfer/cutlass's optional JAX integration - upgrading..."
+    rssh "pip install --upgrade jax 2>&1 | tail -15"
+    rssh "python3 -c 'import jax.numpy as jnp; jnp.float8_e8m0fnu; print(\"jax compatible: OK\")'"
+  else
+    log "jax already compatible"
+  fi
 }
 
 stage_humming() {
