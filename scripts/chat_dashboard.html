@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3.5 Chat</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/highlight.min.js"></script>
+<style>
+  :root {
+    --bg: #212121;
+    --bg-secondary: #2f2f2f;
+    --bg-input: #2f2f2f;
+    --border: #4a4a4a;
+    --text: #ececec;
+    --text-dim: #a0a0a0;
+    --accent: #10a37f;
+    --user-bubble: #2f2f2f;
+    --code-bg: #1a1a1a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0;
+  }
+  header .title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; transition: background 0.3s; }
+  header .dot.online { background: var(--accent); }
+  header .dot.error { background: #e05252; }
+  header .status-text { font-size: 12px; color: var(--text-dim); }
+  header button {
+    background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  header button:hover { background: var(--bg-secondary); color: var(--text); }
+
+  #messages {
+    flex: 1; overflow-y: auto; padding: 20px 0;
+  }
+  .msg-row { padding: 12px 0; }
+  .msg-row.user { display: flex; justify-content: flex-end; }
+  .msg-inner {
+    max-width: 780px; margin: 0 auto; padding: 0 20px; width: 100%;
+  }
+  .msg-row.user .msg-inner { display: flex; justify-content: flex-end; }
+  .bubble.user {
+    background: var(--user-bubble); border-radius: 18px; padding: 10px 16px;
+    max-width: 70%; white-space: pre-wrap; word-wrap: break-word;
+  }
+  .bubble.assistant {
+    line-height: 1.65; font-size: 15px;
+  }
+  .avatar-row { display: flex; gap: 12px; align-items: flex-start; }
+  .avatar {
+    width: 28px; height: 28px; border-radius: 6px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--accent); font-size: 14px; font-weight: 700; color: #fff;
+    margin-top: 2px;
+  }
+  .assistant-content { flex: 1; min-width: 0; }
+
+  .bubble.assistant p { margin: 0 0 12px 0; }
+  .bubble.assistant p:last-child { margin-bottom: 0; }
+  .bubble.assistant h1, .bubble.assistant h2, .bubble.assistant h3 {
+    margin: 20px 0 10px 0; font-weight: 600; line-height: 1.3;
+  }
+  .bubble.assistant h1:first-child, .bubble.assistant h2:first-child, .bubble.assistant h3:first-child { margin-top: 0; }
+  .bubble.assistant h1 { font-size: 22px; }
+  .bubble.assistant h2 { font-size: 19px; }
+  .bubble.assistant h3 { font-size: 16px; }
+  .bubble.assistant ul, .bubble.assistant ol { margin: 8px 0; padding-left: 24px; }
+  .bubble.assistant li { margin: 4px 0; }
+  .bubble.assistant blockquote {
+    border-left: 3px solid var(--border); margin: 10px 0; padding: 2px 14px;
+    color: var(--text-dim);
+  }
+  .bubble.assistant a { color: #7ab8ff; }
+  .bubble.assistant hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+  .bubble.assistant code {
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+  }
+  .bubble.assistant pre {
+    background: var(--code-bg); border-radius: 10px; padding: 0; margin: 10px 0;
+    overflow: hidden; border: 1px solid var(--border);
+  }
+  .bubble.assistant pre code {
+    display: block; padding: 14px 16px; overflow-x: auto; background: transparent;
+    font-size: 13px; line-height: 1.5;
+  }
+  .code-lang-tag {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 14px; font-size: 12px; color: var(--text-dim);
+    background: #262626; border-bottom: 1px solid var(--border);
+  }
+  .code-lang-tag button {
+    background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px;
+  }
+  .code-lang-tag button:hover { color: var(--text); }
+  table { border-collapse: collapse; margin: 10px 0; width: 100%; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; font-size: 13px; }
+  th { background: var(--bg-secondary); }
+
+  .cursor-blink {
+    display: inline-block; width: 8px; height: 1em; background: var(--text);
+    vertical-align: text-bottom; margin-left: 2px;
+    animation: blink 1s step-start infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  #input-area {
+    flex-shrink: 0; padding: 16px 20px 20px 20px;
+  }
+  #input-inner {
+    max-width: 780px; margin: 0 auto;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 20px;
+    display: flex; align-items: flex-end; padding: 8px 8px 8px 18px; gap: 8px;
+  }
+  #input-box {
+    flex: 1; background: transparent; border: none; outline: none; resize: none;
+    color: var(--text); font-size: 15px; font-family: inherit; line-height: 1.4;
+    max-height: 200px; padding: 8px 0;
+  }
+  #send-btn {
+    width: 34px; height: 34px; border-radius: 50%; border: none; background: var(--accent);
+    color: #fff; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+  #send-btn:disabled { background: #555; cursor: not-allowed; }
+  #send-btn.stop { background: #e05252; }
+  .footnote { text-align: center; font-size: 11px; color: var(--text-dim); margin-top: 8px; }
+
+  .empty-state {
+    height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: var(--text-dim); gap: 8px;
+  }
+  .empty-state .big { font-size: 26px; color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">
+      <span class="dot" id="status-dot"></span>
+      Qwen3.5-122B-A10B <span style="color:var(--text-dim); font-weight:400;">· 3-machine pipelined cluster</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:14px;">
+      <span class="status-text" id="status-text">connecting…</span>
+      <button id="clear-btn">Clear chat</button>
+    </div>
+  </header>
+
+  <div id="messages">
+    <div class="empty-state" id="empty-state">
+      <div class="big">Qwen3.5-122B-A10B</div>
+      <div>Ask anything — markdown, code blocks, and LaTeX all render live as it streams.</div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="input-inner">
+      <textarea id="input-box" placeholder="Message Qwen3.5…" rows="1"></textarea>
+      <button id="send-btn">&#8593;</button>
+    </div>
+    <div class="footnote">Responses are generated by the live cluster — verify anything important.</div>
+  </div>
+</div>
+
+<script>
+const API_BASE = ""; // same-origin: proxy serves both this page and /v1/*
+const MODEL = "/data/stage2-checkpoint";
+
+const messagesEl = document.getElementById("messages");
+const emptyState = document.getElementById("empty-state");
+const inputBox = document.getElementById("input-box");
+const sendBtn = document.getElementById("send-btn");
+const clearBtn = document.getElementById("clear-btn");
+const statusDot = document.getElementById("status-dot");
+const statusText = document.getElementById("status-text");
+
+let history = []; // [{role, content}]
+let streaming = false;
+let abortController = null;
+
+// ---------- streaming-safe markdown ----------
+// Core requirement: a ```python fence must render as a live code block the
+// INSTANT it opens, not only once the closing ``` has streamed in. marked.js
+// (and most markdown parsers) treat an unterminated fence as plain text
+// until it closes. Fix: count fence markers in the accumulated text - if
+// odd (an open, unclosed fence), append a synthetic closing fence purely
+// for parsing purposes so marked.js treats the tail as a real code block
+// while it's still arriving.
+function closeDanglingFence(text) {
+  const fenceMatches = text.match(/```/g);
+  const count = fenceMatches ? fenceMatches.length : 0;
+  if (count % 2 === 1) {
+    return text + "\n```";
+  }
+  return text;
+}
+
+// Protect $...$ / $$...$$ / \(...\) / \[...\] from markdown mangling
+// (e.g. underscores in math read as italics) by pulling them out before
+// marked.js runs, then rendering them with KaTeX directly into the
+// resulting HTML afterwards.
+function extractMath(text) {
+  const store = [];
+  const push = (tex, display) => {
+    store.push({ tex, display });
+    return `@@MATH${store.length - 1}@@`;
+  };
+  // block $$...$$ first (greedy across newlines), then \[...\], then
+  // inline $...$ (not matching $$), then \(...\)
+  let out = text
+    .replace(/\$\$([\s\S]+?)\$\$/g, (_, t) => push(t, true))
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_, t) => push(t, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_, t) => push(t, false))
+    .replace(/(?<!\$)\$(?!\$)([^\n$]+?)\$(?!\$)/g, (_, t) => push(t, false));
+  return { text: out, store };
+}
+
+function renderMath(html, store) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  walkAndReplace(div, store);
+  return div.innerHTML;
+}
+
+function walkAndReplace(node, store) {
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const m = child.textContent.match(/@@MATH(\d+)@@/);
+      if (m) {
+        const parts = child.textContent.split(/@@MATH(\d+)@@/g);
+        const frag = document.createDocumentFragment();
+        for (let i = 0; i < parts.length; i++) {
+          if (i % 2 === 0) {
+            if (parts[i]) frag.appendChild(document.createTextNode(parts[i]));
+          } else {
+            const entry = store[parseInt(parts[i], 10)];
+            const span = document.createElement("span");
+            try {
+              katex.render(entry.tex.trim(), span, { throwOnError: false, displayMode: entry.display });
+            } catch (e) {
+              span.textContent = entry.display ? `$$${entry.tex}$$` : `$${entry.tex}$`;
+            }
+            frag.appendChild(span);
+          }
+        }
+        node.replaceChild(frag, child);
+      }
+    } else if (child.nodeType === Node.ELEMENT_NODE && child.tagName !== "PRE" && child.tagName !== "CODE") {
+      walkAndReplace(child, store);
+    }
+  }
+}
+
+marked.setOptions({ breaks: true, gfm: true });
+
+function renderAssistantMarkdown(rawText, showCursor) {
+  const safe = closeDanglingFence(rawText);
+  const { text: withPlaceholders, store } = extractMath(safe);
+  let html = marked.parse(withPlaceholders);
+  html = renderMath(html, store);
+  if (showCursor) html += '<span class="cursor-blink"></span>';
+  return html;
+}
+
+function decorateCodeBlocks(container) {
+  container.querySelectorAll("pre code").forEach((block) => {
+    if (block.dataset.decorated) return;
+    block.dataset.decorated = "1";
+    hljs.highlightElement(block);
+    const pre = block.parentElement;
+    const langClass = Array.from(block.classList).find((c) => c.startsWith("language-"));
+    const lang = langClass ? langClass.replace("language-", "") : "text";
+    const tag = document.createElement("div");
+    tag.className = "code-lang-tag";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy";
+    copyBtn.onclick = () => {
+      navigator.clipboard.writeText(block.textContent);
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => (copyBtn.textContent = "Copy"), 1500);
+    };
+    const label = document.createElement("span");
+    label.textContent = lang;
+    tag.appendChild(label);
+    tag.appendChild(copyBtn);
+    pre.parentElement.insertBefore(tag, pre);
+  });
+}
+
+// ---------- chat rendering ----------
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function addUserMessage(text) {
+  emptyState.style.display = "none";
+  const row = document.createElement("div");
+  row.className = "msg-row user";
+  row.innerHTML = `<div class="msg-inner"><div class="bubble user"></div></div>`;
+  row.querySelector(".bubble").textContent = text;
+  messagesEl.appendChild(row);
+  scrollToBottom();
+}
+
+function addAssistantMessage() {
+  emptyState.style.display = "none";
+  const row = document.createElement("div");
+  row.className = "msg-row assistant";
+  row.innerHTML = `
+    <div class="msg-inner">
+      <div class="avatar-row">
+        <div class="avatar">Q</div>
+        <div class="assistant-content"><div class="bubble assistant"></div></div>
+      </div>
+    </div>`;
+  messagesEl.appendChild(row);
+  scrollToBottom();
+  return row.querySelector(".bubble.assistant");
+}
+
+function setStatus(state, text) {
+  statusDot.className = "dot " + state;
+  statusText.textContent = text;
+}
+
+// ---------- streaming completion ----------
+async function sendMessage() {
+  const text = inputBox.value.trim();
+  if (!text || streaming) return;
+  inputBox.value = "";
+  inputBox.style.height = "auto";
+  history.push({ role: "user", content: text });
+  addUserMessage(text);
+
+  const bubble = addAssistantMessage();
+  let accumulated = "";
+  streaming = true;
+  sendBtn.textContent = "■";
+  sendBtn.classList.add("stop");
+  abortController = new AbortController();
+
+  try {
+    const resp = await fetch(API_BASE + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: abortController.signal,
+      body: JSON.stringify({
+        model: MODEL,
+        messages: history,
+        max_tokens: 1024,
+        temperature: 0.7,
+        stream: true,
+      }),
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error("HTTP " + resp.status);
+    }
+    setStatus("online", "streaming…");
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop(); // keep incomplete last line in buffer
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const obj = JSON.parse(payload);
+          const delta = obj.choices?.[0]?.delta?.content;
+          if (delta) {
+            accumulated += delta;
+            bubble.innerHTML = renderAssistantMarkdown(accumulated, true);
+            decorateCodeBlocks(bubble);
+            scrollToBottom();
+          }
+        } catch (e) { /* partial JSON line, ignore */ }
+      }
+    }
+    bubble.innerHTML = renderAssistantMarkdown(accumulated, false);
+    decorateCodeBlocks(bubble);
+    history.push({ role: "assistant", content: accumulated });
+    setStatus("online", "ready");
+  } catch (e) {
+    if (e.name === "AbortError") {
+      bubble.innerHTML = renderAssistantMarkdown(accumulated + "\n\n*(stopped)*", false);
+      history.push({ role: "assistant", content: accumulated });
+    } else {
+      bubble.innerHTML = renderAssistantMarkdown(accumulated || "", false) +
+        `<div style="color:#e05252; margin-top:8px;">Error: ${e.message}</div>`;
+      setStatus("error", "error");
+    }
+  } finally {
+    streaming = false;
+    sendBtn.textContent = "↑";
+    sendBtn.classList.remove("stop");
+    scrollToBottom();
+  }
+}
+
+sendBtn.addEventListener("click", () => {
+  if (streaming) {
+    abortController?.abort();
+  } else {
+    sendMessage();
+  }
+});
+inputBox.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+inputBox.addEventListener("input", () => {
+  inputBox.style.height = "auto";
+  inputBox.style.height = Math.min(inputBox.scrollHeight, 200) + "px";
+});
+clearBtn.addEventListener("click", () => {
+  history = [];
+  messagesEl.innerHTML = "";
+  messagesEl.appendChild(emptyState);
+  emptyState.style.display = "flex";
+});
+
+// ---------- health check ----------
+async function checkHealth() {
+  try {
+    const r = await fetch(API_BASE + "/health", { method: "GET" });
+    if (r.ok) setStatus("online", "ready");
+    else setStatus("error", "unhealthy");
+  } catch (e) {
+    setStatus("error", "unreachable");
+  }
+}
+checkHealth();
+setInterval(checkHealth, 15000);
+</script>
+</body>
+</html>
