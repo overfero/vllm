@@ -21,6 +21,19 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Real bug hit running this for real: nothing stopped two instances of
+# this script from running concurrently (e.g. an automated retry/cron
+# firing again before a slow first run finished) - both raced through the
+# same launch/cleanup steps against the same 3 machines, corrupting the
+# deployment. Take an flock lock for the whole script; a second concurrent
+# invocation exits immediately instead of racing.
+LOCKFILE="/tmp/qwen35_122ba10b_3machine.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  echo "[3machine] ERROR: another instance of this script is already running (lock: $LOCKFILE) - refusing to start a second one." >&2
+  exit 1
+fi
+
 # Real bug hit running this for real: a fresh torch/vllm install's .so
 # files exist but dlopen can't find libtorch.so/libcudart.so without this -
 # `import vllm._C_stable_libtorch` fails with `ImportError: libtorch.so:
