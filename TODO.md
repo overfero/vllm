@@ -68,6 +68,29 @@ any of this - both stay independently runnable.
   (n=1/4/8, all requests arriving at once) already gets fully captured by
   plain continuous batching regardless of pipelining.
 
+## New candidate, not yet deployed at all (needs Machine D)
+
+- [ ] **`cluster/qwen35_122ba10b_4machine_pipelined_mtp.sh`** - combines
+  three previously-separate, individually-proven pieces that have never
+  been run together: asymmetric 16/16/12/4 split (`74560238f`), MTP +
+  CUDA graphs + `--cpu-offload-gb 3` on the 16-layer stages (`fe3246ff6`
+  - but that commit only validated cudagraph+MTP on the UNIFORM
+  12/12/12/12 split, reverted FROM asymmetric first, so cudagraph+MTP+
+  asymmetric-split together is new), and this session's pipelining +
+  RPC fusion (only proven on 3-machine/no-MTP/uniform-split so far).
+  Blocked on Machine D credentials in `.env` (not available this
+  session). `NUM_GPU_BLOCKS_OVERRIDE=20` in the script is a deliberately
+  conservative, UNMEASURED placeholder for this topology - real safe
+  values must be re-derived from the first run's profiler logs on all 4
+  machines (see the script's own comment for exactly how) before trusting
+  it for anything beyond a first correctness check. Real user question
+  this resolved: MTP's actual VRAM cost on a 16-layer stage is ~1-2GiB
+  (own vocab embedding + one MoE decoder layer, constructed on every
+  rank due to a synthetic-PP-group quirk - see `docs/DEPLOYMENT.md`'s
+  "Asymmetric PP splits" section), not the ~180MB originally assumed -
+  that's what caused the original OOM before `--cpu-offload-gb 3` fixed
+  it.
+
 ## Real, understood, deliberately not pursued further (for now)
 
 - [ ] **`async_scheduling=False`** - real speedup left on the table (hides
