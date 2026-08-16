@@ -8,24 +8,64 @@ current active thread.
 
 ## Current blocker
 
-**Akun3 (Machine B in the pipeline) disconnected mid-benchmark** -
+**Akun4 (Machine C, the driver) disconnected mid-benchmark** -
 `Connection reset by peer` / `kex_exchange_identification` on every SSH
-retry, consistent across multiple attempts, not a transient blip (Kaggle
-free-tier session almost certainly ended/timed out). Machine B going away
-during a live request made Machine C (the driver) crash and fully shut
-down too - **the whole cluster is down right now**, not just one machine.
+retry, consistent across multiple attempts (same pattern Akun3 showed
+earlier this session before it needed a fresh Kaggle session restart).
+The whole cluster is down again.
+
+This is the SECOND time in this session a machine has dropped mid-sweep
+(first Akun3, now Akun4) - these free-tier Kaggle sessions are clearly
+not reliable for a benchmark run that takes several minutes per
+concurrency level. Consider running fewer repetitions per level, or
+accepting single-sample noise as a real constraint of this environment,
+rather than re-attempting the full N=1,2,4,6,8 sweep repeatedly.
 
 **To resume:**
-1. Check/restart Akun3's Kaggle session, get a fresh SSH port+password.
-2. Update `.env`'s `MACHINE_B_PORT`/`MACHINE_B_PASSWORD` (Akun3) - Akun4
-   (`MACHINE_C_PORT`/`MACHINE_C_PASSWORD`) should still be fine, worth a
-   quick reachability check first though.
+1. Check/restart Akun4's Kaggle session, get a fresh SSH port+password.
+   Akun3 should still be fine (was refreshed most recently) but worth a
+   quick reachability check first.
+2. Update `.env`'s `MACHINE_C_PORT`/`MACHINE_C_PASSWORD` (Akun4).
 3. Redeploy: `bash cluster/qwen35_122ba10b_3machine_pipelined.sh` (or the
    debug-timing-enabled scratchpad variant if profiling is still wanted -
    see "How to reproduce" below, it doesn't survive scratchpad resets so
    may need rebuilding).
-4. Re-run the concurrency sweep (N=1,2,4,6,8) and compare against the
-   backed-up pre-fix baseline (see "Data already collected" below).
+4. Re-run just N=6 and N=8 (see "Data already collected" - N=1/2/4 are
+   already in, one more disconnect away from a full comparison).
+
+## IMPORTANT - the fix's real-world result so far is NOT positive
+
+The partial post-fix comparison actually obtained (N=1, 2, 4) does **not**
+support the GIL-switchinterval fix - N=4 regressed **-27.8%** (49.59 ->
+35.8 tok/s aggregate), N=1/N=2 also slightly down (-3.6%/-3.1%, could be
+noise). This directly contradicts the synthetic benchmark's prediction
+(mean 40ms->7.2ms latency improvement). Do NOT report this fix as a
+win without re-verifying - possible explanations, none confirmed yet:
+
+1. **Real, previously-missed trade-off**: a shorter switch interval
+   reduces scheduling latency for I/O-bound threads but increases
+   context-switch FREQUENCY, each with real overhead. If the actual
+   workload here is more CPU-bound-throughput-sensitive than
+   latency-sensitive, 0.0005 could be a net loss. Worth trying a middle
+   value (e.g. 0.001-0.002) rather than assuming smaller is always
+   better.
+2. **Confounded comparison**: the pre-fix baseline and this post-fix
+   partial run were NOT taken under matching conditions - multiple
+   crashes/restarts happened in between, system/thermal/neighbor-load
+   state on the underlying shared Kaggle hardware may differ.
+3. **Single-sample noise**: this project already proved elsewhere in this
+   session that a single concurrency-level sample can be a significant
+   outlier (n=8 measured 16.07 tok/s once, 28.45 tok/s averaged over 8
+   rounds). Neither the pre-fix nor post-fix numbers here were
+   multi-round-averaged.
+
+**Recommended next step once the cluster is back up**: before trusting
+any conclusion, re-run at least N=4 a few times (or use
+`benchmark_8x8.py`-style multi-round averaging, see earlier session
+history) under stable conditions. If the regression holds up, consider
+reverting `sys.setswitchinterval(0.0005)` to a milder value or reverting
+entirely - the fix is not proven beneficial yet, only plausible in
+theory and in an isolated synthetic benchmark.
 
 ## What's already done
 
@@ -77,9 +117,18 @@ Real numbers already reported to the user mid-session:
 | 6 | 60.94 | 10.17 |
 | 8 | 78.25 | 9.82 |
 
-Post-fix: only N=1 confirmed (16.81 tok/s, matches). **N=2/4/6/8 not yet
-re-measured with the fix** - this is the actual point of doing this pass,
-still outstanding.
+Post-fix (this environment's second attempt, Akun3+Akun4 redeployed):
+
+| N | Aggregate tok/s (post-fix) | Per-request tok/s (post-fix) | vs pre-fix |
+|---|---|---|---|
+| 1 | 16.19 | 16.21 | -3.6% |
+| 2 | 33.94 | 16.99 | -3.1% |
+| 4 | 35.8 | 8.96 | **-27.8%** |
+| 6 | (not measured - Akun4 dropped before this level ran) | | |
+| 8 | (not measured - Akun4 dropped before this level ran) | | |
+
+See "IMPORTANT" section above - this does NOT look like a win, needs
+re-verification, not just completion of the remaining levels.
 
 Scratchpad note: this environment has reset/wiped scratchpad contents at
 least twice already this session (once mid-conversation, unprompted) -
