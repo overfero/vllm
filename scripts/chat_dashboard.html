@@ -218,20 +218,34 @@ const clearBtn = document.getElementById("clear-btn");
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
 
-// Real behavior found testing this checkpoint directly: without any
-// nudge it either skips <think>...</think> entirely and rambles in plain
-// "Thinking Process:" prose with no clean end boundary, or (with
-// chat_template_kwargs.enable_thinking:true) still doesn't reliably close
-// the tag. A system prompt asking for the tag AND brevity fixed both -
-// closes with a real </think> and keeps the reasoning to a few sentences
-// instead of multiple full drafts. Kept out of the visible chat history
-// (first array entry, never rendered as a bubble) but sent with every
-// request.
+// Real behavior found testing this checkpoint directly, through two
+// failed attempts before landing here:
+// 1. No nudge at all: skips </think> entirely, rambles in plain
+//    "Thinking Process:" prose with no clean end boundary.
+// 2. Asking for BREVITY on top of the tag backfired - this checkpoint
+//    has a strongly ingrained "Thinking Process: 1. Analyze the
+//    Request..." numbered-list habit that largely ignores format/length
+//    instructions.
+// 3. Spelling out the literal string "</think>" in this prompt (even
+//    just asking it to close with one, no brevity ask) backfired
+//    DIFFERENTLY: the model's own "1. Analyze the Request" habit quotes
+//    the system prompt back verbatim as one of the constraints it's
+//    parsing, which means the literal text "</think>" shows up in its
+//    OWN early reasoning, well before any real closing tag - a false
+//    match splits the response in the wrong place (verified live: on a
+//    "why is the sky blue" question it split after 195 chars, right in
+//    the middle of the model quoting this very instruction back).
+// Fix: never put the literal tag text in the prompt at all - just ask
+// it to reason then answer, in plain language. The auto-inserted
+// "<think>\n" from chat_template.jinja's generation-prompt block (see
+// splitThinking()'s own comment) already puts the model in reasoning
+// mode; it reliably closes with a real, single </think> once it's
+// actually done, given enough max_tokens (verified live at 2048 on a
+// substantive question: 3514 chars of reasoning, closed cleanly,
+// finish_reason "stop"). Kept out of the visible chat history (first
+// array entry, never rendered as a bubble) but sent with every request.
 const SYSTEM_PROMPT =
-  "When you need to reason through a problem, think through it briefly, " +
-  "then close your reasoning with </think> before giving the final " +
-  "answer. Keep the reasoning short - a few sentences at most. Don't " +
-  "write multiple drafts or restate the question at length.";
+  "Reason through the problem first, then clearly give your final answer.";
 
 function freshHistory() {
   return [{ role: "system", content: SYSTEM_PROMPT }];
@@ -482,7 +496,7 @@ async function sendMessage() {
       body: JSON.stringify({
         model: MODEL,
         messages: history,
-        max_tokens: 1024,
+        max_tokens: 2048,
         temperature: 0.7,
         stream: true,
       }),
