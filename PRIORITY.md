@@ -21,6 +21,20 @@ concurrency level. Consider running fewer repetitions per level, or
 accepting single-sample noise as a real constraint of this environment,
 rather than re-attempting the full N=1,2,4,6,8 sweep repeatedly.
 
+**Root cause of the Akun4 drop, per the user**: the Kaggle session itself
+reported "Cannot connect to the Docker daemon at tcp://172.21.76.220:2375
+- Is the docker daemon running?", suggesting high /tmp usage / possible
+disk exhaustion. Checked this directly on Machine A (local) and Akun3
+(both reachable at the time): both show healthy disk - 88% used but
+~997GB still free on the container's own overlay filesystem, `/tmp` only
+a few KB, `~/.cache/vllm` (torch compile cache) only ~430MB. **Nothing
+in what our own deploy process writes explains a disk-exhaustion crash**
+- this points to a Kaggle platform/host-level issue (the underlying
+Docker host serving that specific session, not our container's own disk),
+outside anything fixable from our side. Don't spend time looking for a
+self-inflicted disk-usage bug in the deploy scripts based on this - the
+evidence doesn't support it.
+
 **To resume:**
 1. Check/restart Akun4's Kaggle session, get a fresh SSH port+password.
    Akun3 should still be fine (was refreshed most recently) but worth a
