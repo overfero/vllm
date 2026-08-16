@@ -188,18 +188,42 @@ class TransportPPWorker(Worker):
         self._transport_timing_self_name = self_name
 
     def execute_model(self, scheduler_output):
-        # Real generation-throughput investigation (2026-08-12): wraps the
-        # real execute_model() call (recv-from-prev + local forward compute
-        # + send-to-next, for a middle stage) with a total-duration log so
-        # local compute time can be derived as
-        # total_duration - sum(TRANSPORT_TIMING send/recv durations logged
-        # by udp_transport.py during this same call) - correlate by
-        # timestamp per machine, single in-flight request only.
+        # Real generation-throughput investigation (2026-08-12, revised
+        # 2026-08-16): originally just logged total duration and left
+        # compute time to be derived later by subtracting separately-
+        # aggregated TRANSPORT_TIMING stats (e.g. median(total) -
+        # median(send)) - found invalid afterward, since those aggregates
+        # weren't computed from the same paired steps (each stat was its
+        # own independent aggregation pass, not matched 1:1 to a specific
+        # step). Fixed by reading vllm.distributed.parallel_state's
+        # per-step send/recv tensor-dict accumulator (reset right before
+        # this call, read right after) so recv_ms/send_ms/compute_ms in
+        # a single log line are guaranteed to come from the SAME step as
+        # total_ms - properly isolated, not derived from aggregates.
+        debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+        if debug_timing:
+            from vllm.distributed.parallel_state import (
+                get_transport_tensor_dict_timing,
+                reset_transport_tensor_dict_timing,
+            )
+            reset_transport_tensor_dict_timing()
         _t0 = time.monotonic()
         result = super().execute_model(scheduler_output)
-        logger.info(
-            "[EXECUTE_MODEL_TIMING] self=%s duration_ms=%.2f",
-            getattr(self, "_transport_timing_self_name", "?"),
-            (time.monotonic() - _t0) * 1000,
-        )
+        total_ms = (time.monotonic() - _t0) * 1000
+        self_name = getattr(self, "_transport_timing_self_name", "?")
+        if debug_timing:
+            timing = get_transport_tensor_dict_timing()
+            recv_ms = timing["recv_ms"]
+            send_ms = timing["send_ms"]
+            compute_ms = total_ms - recv_ms - send_ms
+            logger.info(
+                "[STEP_BREAKDOWN] self=%s total_ms=%.2f recv_ms=%.2f "
+                "compute_ms=%.2f send_ms=%.2f",
+                self_name, total_ms, recv_ms, compute_ms, send_ms,
+            )
+        else:
+            logger.info(
+                "[EXECUTE_MODEL_TIMING] self=%s duration_ms=%.2f",
+                self_name, total_ms,
+            )
         return result

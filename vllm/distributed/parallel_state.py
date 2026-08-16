@@ -28,6 +28,7 @@ import gc
 import os
 import pickle
 import struct
+import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -109,6 +110,28 @@ def _split_tensor_dict(
 
 _DICT_HEADER = struct.Struct("!I")
 
+# 2026-08-16 isolated compute-time profiling: earlier attempts derived
+# "pure compute" by subtracting independently-aggregated median/mean stats
+# (e.g. median(total) - median(recv) - median(send)) - invalid whenever the
+# underlying per-step samples aren't paired 1:1, which they weren't (each
+# stat came from its own separate aggregation pass). This accumulator
+# instead measures send/recv on the SAME step that produces the total
+# time, so a single log line can report a properly paired breakdown for
+# that one step: compute_ms = total_ms - recv_ms - send_ms, all three
+# numbers from the same execute_model() call. One process per TP rank
+# (real multiprocessing, not threads), so a plain module-level dict is
+# safe - no cross-rank sharing, no lock needed.
+_transport_tensor_dict_timing = {"send_ms": 0.0, "recv_ms": 0.0}
+
+
+def reset_transport_tensor_dict_timing() -> None:
+    _transport_tensor_dict_timing["send_ms"] = 0.0
+    _transport_tensor_dict_timing["recv_ms"] = 0.0
+
+
+def get_transport_tensor_dict_timing() -> dict[str, float]:
+    return dict(_transport_tensor_dict_timing)
+
 
 def _debug_tensor_dict_stats(prefix: str, tensor_dict: dict[str, Any]) -> None:
     if not os.environ.get("VLLM_TRANSPORT_DEBUG_TENSOR_STATS"):
@@ -137,6 +160,7 @@ def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
     from vllm.transport.tensor import serialize_tensor
 
     _debug_tensor_dict_stats("SEND", tensor_dict)
+    _t0 = time.perf_counter() if os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING") else None
     metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
     header = pickle.dumps(metadata_list)
     parts = [_DICT_HEADER.pack(len(header)), header]
@@ -145,12 +169,15 @@ def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
         parts.append(_DICT_HEADER.pack(len(payload)))
         parts.append(payload)
     transport.send(b"".join(parts))
+    if _t0 is not None:
+        _transport_tensor_dict_timing["send_ms"] += (time.perf_counter() - _t0) * 1000
 
 
 def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
     """Inverse of `_transport_send_tensor_dict`."""
     from vllm.transport.tensor import deserialize_tensor
 
+    _t0 = time.perf_counter() if os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING") else None
     data = transport.recv()
     offset = 0
     (meta_len,) = _DICT_HEADER.unpack_from(data, offset)
@@ -172,6 +199,8 @@ def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
         else:
             result[key] = value
     _debug_tensor_dict_stats("RECV", result)
+    if _t0 is not None:
+        _transport_tensor_dict_timing["recv_ms"] += (time.perf_counter() - _t0) * 1000
     return result
 
 
