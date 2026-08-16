@@ -1,129 +1,102 @@
 # PRIORITY — resume here (2026-08-16)
 
-Blocked mid-optimization-pass. Everything needed to pick this back up
-exactly where it left off is below. See also `TODO.md` for older,
-lower-urgency open items from the previous session (num_gpu_blocks_override
-validation, block-count-drop investigation, etc.) — this file is just the
-current active thread.
+See also `TODO.md` for older, lower-urgency open items from the previous
+session (num_gpu_blocks_override validation, block-count-drop
+investigation, etc.) — this file is the current active thread.
 
 ## Current blocker
 
 **Akun4 (Machine C, the driver) disconnected mid-benchmark** -
 `Connection reset by peer` / `kex_exchange_identification` on every SSH
-retry, consistent across multiple attempts (same pattern Akun3 showed
-earlier this session before it needed a fresh Kaggle session restart).
-The whole cluster is down again.
+retry. Same pattern Akun3 hit earlier this session. The whole cluster is
+down. User reported the Kaggle session itself showed a Docker daemon
+connection error suggesting possible disk exhaustion - checked disk usage
+directly on Machine A and Akun3 (both reachable at the time): both
+healthy, ~997GB free, `/tmp` negligible, torch compile cache only
+~430MB. **Nothing in our own deploy process explains this** - most likely
+a Kaggle platform/host-level issue, not a bug to chase in our scripts.
 
-This is the SECOND time in this session a machine has dropped mid-sweep
-(first Akun3, now Akun4) - these free-tier Kaggle sessions are clearly
-not reliable for a benchmark run that takes several minutes per
-concurrency level. Consider running fewer repetitions per level, or
-accepting single-sample noise as a real constraint of this environment,
-rather than re-attempting the full N=1,2,4,6,8 sweep repeatedly.
+**To resume:** check/restart Akun4's Kaggle session, get a fresh SSH
+port+password, update `.env`'s `MACHINE_C_PORT`/`MACHINE_C_PASSWORD`,
+redeploy with `bash cluster/qwen35_122ba10b_3machine_pipelined.sh`.
 
-**Root cause of the Akun4 drop, per the user**: the Kaggle session itself
-reported "Cannot connect to the Docker daemon at tcp://172.21.76.220:2375
-- Is the docker daemon running?", suggesting high /tmp usage / possible
-disk exhaustion. Checked this directly on Machine A (local) and Akun3
-(both reachable at the time): both show healthy disk - 88% used but
-~997GB still free on the container's own overlay filesystem, `/tmp` only
-a few KB, `~/.cache/vllm` (torch compile cache) only ~430MB. **Nothing
-in what our own deploy process writes explains a disk-exhaustion crash**
-- this points to a Kaggle platform/host-level issue (the underlying
-Docker host serving that specific session, not our container's own disk),
-outside anything fixable from our side. Don't spend time looking for a
-self-inflicted disk-usage bug in the deploy scripts based on this - the
-evidence doesn't support it.
+## CLOSED: GIL switchinterval fix - investigated, tried, reverted
 
-**To resume:**
-1. Check/restart Akun4's Kaggle session, get a fresh SSH port+password.
-   Akun3 should still be fine (was refreshed most recently) but worth a
-   quick reachability check first.
-2. Update `.env`'s `MACHINE_C_PORT`/`MACHINE_C_PASSWORD` (Akun4).
-3. Redeploy: `bash cluster/qwen35_122ba10b_3machine_pipelined.sh` (or the
-   debug-timing-enabled scratchpad variant if profiling is still wanted -
-   see "How to reproduce" below, it doesn't survive scratchpad resets so
-   may need rebuilding).
-4. Re-run just N=6 and N=8 (see "Data already collected" - N=1/2/4 are
-   already in, one more disconnect away from a full comparison).
+Full arc, so this doesn't get re-litigated from scratch later:
 
-## IMPORTANT - the fix's real-world result so far is NOT positive
+1. Found real RPC round trips (20-50ms) were far slower than raw network
+   (`pp_tests/real_ping_pong.py`: 1.21ms RTT between co-located machines,
+   confirmed with both Akun3 and Akun4, 0% loss). Ruled out payload size
+   with a size-matched ping-pong test (2000 bytes, same ~1.3ms result).
+2. Hypothesized GIL contention (Python's default `sys.setswitchinterval()`
+   is 5ms; many threads per process - reader threads, per-link asyncio
+   loops, `_combine_pool` workers - competing for the GIL). A synthetic
+   benchmark reproducing the same shape supported this (mean 40ms->7.2ms
+   improvement at a shorter interval).
+3. Implemented `sys.setswitchinterval(0.0005)` in
+   `TransportExecutor._init_executor()` and `stage_server.py`'s `main()`,
+   deployed live, benchmarked N=1/2/4 against the pre-fix baseline.
+4. **Result: no improvement, real regression at N=4 (-27.8%, 49.59->35.8
+   tok/s aggregate)**, N=1/N=2 also slightly down. Directly contradicted
+   the synthetic benchmark's prediction.
+5. **Root cause of why the fix didn't help, found via direct before/after
+   comparison of the SAME metric on the SAME machines**: hop send time
+   was already ~1.3-1.4ms median BEFORE the fix, ~1.5-1.65ms after -
+   essentially unchanged. The fix never had anything real to improve;
+   the RPC/transport layer was never the bottleneck it was built to fix.
+6. **Reverted** (commit after `3972245f5`) - removed
+   `sys.setswitchinterval(0.0005)` from both files, `sys` import cleaned
+   up from `rpc_executor.py` (was otherwise unused there). Not worth
+   keeping unproven custom code with a demonstrated regression risk.
 
-The partial post-fix comparison actually obtained (N=1, 2, 4) does **not**
-support the GIL-switchinterval fix - N=4 regressed **-27.8%** (49.59 ->
-35.8 tok/s aggregate), N=1/N=2 also slightly down (-3.6%/-3.1%, could be
-noise). This directly contradicts the synthetic benchmark's prediction
-(mean 40ms->7.2ms latency improvement). Do NOT report this fix as a
-win without re-verifying - possible explanations, none confirmed yet:
+## ACTUAL finding: per-stage compute time is the real latency driver, not transport
 
-1. **Real, previously-missed trade-off**: a shorter switch interval
-   reduces scheduling latency for I/O-bound threads but increases
-   context-switch FREQUENCY, each with real overhead. If the actual
-   workload here is more CPU-bound-throughput-sensitive than
-   latency-sensitive, 0.0005 could be a net loss. Worth trying a middle
-   value (e.g. 0.001-0.002) rather than assuming smaller is always
-   better.
-2. **Confounded comparison**: the pre-fix baseline and this post-fix
-   partial run were NOT taken under matching conditions - multiple
-   crashes/restarts happened in between, system/thermal/neighbor-load
-   state on the underlying shared Kaggle hardware may differ.
-3. **Single-sample noise**: this project already proved elsewhere in this
-   session that a single concurrency-level sample can be a significant
-   outlier (n=8 measured 16.07 tok/s once, 28.45 tok/s averaged over 8
-   rounds). Neither the pre-fix nor post-fix numbers here were
-   multi-round-averaged.
+Broke down a single (N=1) request's per-token latency using the existing
+`[EXECUTE_MODEL_TIMING]` (total duration of `TransportPPWorker.execute_model` -
+recv-from-prev + local compute + send-to-next) and `[TRANSPORT_TIMING]`
+(real send/recv duration on the wire, logged unconditionally by
+`udp_transport.py`, no debug flag needed) - both already existed in the
+code before this session, just hadn't been read together before.
 
-**Recommended next step once the cluster is back up**: before trusting
-any conclusion, re-run at least N=4 a few times (or use
-`benchmark_8x8.py`-style multi-round averaging, see earlier session
-history) under stable conditions. If the regression holds up, consider
-reverting `sys.setswitchinterval(0.0005)` to a milder value or reverting
-entirely - the fix is not proven beneficial yet, only plausible in
-theory and in an isolated synthetic benchmark.
+| Stage | Total/step | Real hop (send, measured) |
+|---|---|---|
+| A (first) | 17.0ms | ~2.9ms |
+| B (middle) | 27.5ms | ~2.9ms |
+| C (last, driver) | ~39.5ms (median of non-filler steps) | - (no next stage) |
 
-## What's already done
+**Real transfer time is small (~2.9ms/hop, ~6ms total across 2 hops) -
+this is NOT the bottleneck.** Per-stage compute is what dominates,
+especially Machine C (~39.5ms) - the last stage carries the full
+`lm_head` (projects to full vocab, a big matmul), sampling logic, AND
+driver/API-server/scheduler overhead all in the same process. This is
+consistent with earlier (unrelated) findings this session about C's
+structurally heavier role.
 
-- **Root-caused why real RPC round trips (20-50ms) were ~20-40x slower
-  than raw network** (confirmed via `pp_tests/real_ping_pong.py`: 1.21ms
-  RTT between Machine A and both Akun3 and Akun4, co-located Iowa
-  datacenter, 0% loss). Ruled out payload size as the cause with a
-  size-matched ping-pong test (2000 bytes, same result: ~1.3ms) - the
-  actual RPC dispatch path was measuring 20-50ms for the same size
-  payloads, so neither network nor serialization-over-wire explained the
-  gap.
-- **Identified GIL contention as the real cause**: Python's default
-  `sys.setswitchinterval()` is 5ms; with multiple threads per process
-  (reader threads, per-link asyncio event loop threads, `_combine_pool`
-  workers, all contending against the main EngineCore scheduling loop),
-  a thread with real work ready (e.g. a reader thread whose recv() queue
-  just got a reply) can sit unscheduled for up to one switch interval. A
-  synthetic benchmark reproducing the same shape (CPU-bound threads +
-  queue-based responder/waiter) measured mean 40ms/max 549ms at the
-  default 5ms interval vs mean 7.2ms/max 28ms at 0.5ms - closely matching
-  the real numbers observed.
-- **Fix implemented and committed**: `sys.setswitchinterval(0.0005)` added
-  early in `TransportExecutor._init_executor()`
-  (`vllm/transport/rpc_executor.py`) and `stage_server.py`'s `main()`.
-  Commit `062a5d6c8`, pushed.
-- **Partially verified live**: redeployed with the fix
-  (`vllm-0.1.dev24+g062a5d6c8`), sanity check passed (correct output),
-  N=1 benchmark matched pre-fix baseline exactly (16.81 tok/s - expected,
-  N=1 has no concurrent threads to contend over, so no difference should
-  show there). **N=2/4/6/8 comparison never completed** - Akun3 dropped
-  during the N=1 step of the sweep script itself (the very first
-  concurrent-load test), before any of the levels that would actually
-  exercise the fix could run.
+Caveat: summing all 3 stages (17.0+27.5+39.5=84ms) doesn't cleanly match
+the observed ~60ms/token at N=1 - each stage's own `recv` duration is
+inclusive of upstream wait time (not pure network), so there's some
+double-counting risk in a naive sum, and/or genuine partial overlap even
+at N=1. Not fully reconciled to the ms - the qualitative conclusion (hop
+is small, compute dominates, C is heaviest) is solid; the exact
+decomposition isn't.
 
-## Data already collected (for the eventual before/after comparison)
+**Where to look next if resuming this thread**: reducing Machine C's own
+compute load (asymmetric split giving C fewer real layers - proven
+possible, see `docs/DEPLOYMENT.md`'s "Asymmetric PP splits" - or offloading
+the API server/scheduler to a dedicated non-compute machine, see this
+project's own older "4th-machine pure coordinator" idea in the previous
+session's TODO.md) is the evidence-backed lever for individual
+(single-request) latency - NOT the transport layer, which is already
+about as fast as raw network allows.
 
-Pre-fix baseline (full N=1,2,4,6,8 sweep, compute+hop timing included) is
-backed up at
+## Data collected this session (for reference, not yet fully used)
+
+Pre-GIL-fix baseline (full N=1,2,4,6,8 sweep, compute+hop timing
+included) backed up at
 `/tmp/claude-0/-kaggle-working/0e01be65-4d72-46f1-86eb-799cd4663b95/scratchpad/baseline_before_gilfix/`
-- 20 files (`sweep_n*.jsonl` for throughput, `a/b/c_timing_n*.txt` for the
-  raw `stage-exec-timing`/`rpc-pipelined-timing` log lines per level).
-Real numbers already reported to the user mid-session:
+(20 files). Real numbers:
 
-| N | Aggregate tok/s (pre-fix) | Per-request tok/s (pre-fix) |
+| N | Aggregate tok/s | Per-request tok/s |
 |---|---|---|
 | 1 | 16.81 | 16.81 |
 | 2 | 35.01 | 17.53 |
@@ -131,44 +104,29 @@ Real numbers already reported to the user mid-session:
 | 6 | 60.94 | 10.17 |
 | 8 | 78.25 | 9.82 |
 
-Post-fix (this environment's second attempt, Akun3+Akun4 redeployed):
-
-| N | Aggregate tok/s (post-fix) | Per-request tok/s (post-fix) | vs pre-fix |
-|---|---|---|---|
-| 1 | 16.19 | 16.21 | -3.6% |
-| 2 | 33.94 | 16.99 | -3.1% |
-| 4 | 35.8 | 8.96 | **-27.8%** |
-| 6 | (not measured - Akun4 dropped before this level ran) | | |
-| 8 | (not measured - Akun4 dropped before this level ran) | | |
-
-See "IMPORTANT" section above - this does NOT look like a win, needs
-re-verification, not just completion of the remaining levels.
-
-Scratchpad note: this environment has reset/wiped scratchpad contents at
-least twice already this session (once mid-conversation, unprompted) -
-don't assume anything under `/tmp/claude-0/.../scratchpad/` survives
-indefinitely. `benchmark_6agents.py` and `full_profiling_sweep.sh` may
-need to be recreated if gone; their content is reconstructable from this
-conversation's history if needed, or ask - they're straightforward
+Scratchpad note: this environment has reset/wiped scratchpad contents
+multiple times this session, unprompted - don't assume anything under
+`/tmp/claude-0/.../scratchpad/` survives indefinitely. Benchmark/sweep
+scripts may need recreating if gone; straightforward to rebuild
 (concurrent `urllib` requests to `/v1/completions`, log-line-diffing per
-concurrency level).
+concurrency level) - ask if needed rather than guessing their old shape.
 
-## How to reproduce the debug-timing deploy
+## How to reproduce the debug-timing deploy (for [EXECUTE_MODEL_TIMING] /
+## [stage-exec-timing] / [rpc-pipelined-timing])
 
 The committed `cluster/qwen35_122ba10b_3machine_pipelined.sh` does NOT
-set `VLLM_TRANSPORT_DEBUG_TIMING=1` by default (adds log noise, not meant
-for normal runs). To get the `[stage-exec-timing]` /
-`[rpc-pipelined-timing]` breakdown again: copy the script, inject
-`VLLM_TRANSPORT_DEBUG_TIMING=1` before each of the 3 stage-launch
-commands (local `nohup` for Machine A, and `export
+set `VLLM_TRANSPORT_DEBUG_TIMING=1` by default. To get that breakdown:
+copy the script, inject `VLLM_TRANSPORT_DEBUG_TIMING=1` before each of
+the 3 stage-launch commands (local `nohup` for Machine A, `export
 VLLM_TRANSPORT_DEBUG_TIMING=1 &&` inside each remote SSH command string
 for B/C), fix the `cd "$(dirname ...)/.."` line to a hardcoded
-`cd /kaggle/working/vllm` if run from outside `cluster/` (e.g. from
-scratchpad).
+`cd /kaggle/working/vllm` if run from outside `cluster/`. Note:
+`[TRANSPORT_TIMING]` (used for the compute-vs-hop breakdown above) is
+logged unconditionally by `udp_transport.py` regardless of this flag -
+only `[EXECUTE_MODEL_TIMING]`, `[stage-exec-timing]`, and
+`[rpc-pipelined-timing]` need it.
 
-## Known deploy-script gotchas hit again this session (already documented
-## in commit messages / code comments, listed here just so they don't
-## cost time twice)
+## Known deploy-script gotchas hit again this session
 
 - `pkill -f 'pattern'` run inside a single SSH command string can match
   the wrapping `bash -c "..."` process itself (its cmdline literally
@@ -184,3 +142,7 @@ scratchpad).
   error (stuck in `wait` on a detached SSH session), find and `kill -9`
   it specifically - don't touch the signaling server / zrok tunnel
   process it may have forked.
+- SSH host keys change every time a Kaggle account's session restarts
+  (fresh container = fresh host key) even if the port number is reused -
+  `ssh-keygen -f "/root/.ssh/known_hosts" -R "[127.0.0.1]:<port>"` before
+  retrying if you see "REMOTE HOST IDENTIFICATION HAS CHANGED".
