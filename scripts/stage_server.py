@@ -375,15 +375,6 @@ def _serve_rpc_loop(transport, model_executor) -> None:
 
 
 def main() -> int:
-    # 2026-08-16 GIL contention fix - see rpc_executor.py's matching
-    # _init_executor comment for the full real measurement behind this:
-    # a payload-size-matched ping-pong test proved the network/serialization
-    # weren't the source of the 20-50ms round trips actually seen under
-    # real load, only leaving this process's own threads (the transport's
-    # background asyncio event loop, this main receive loop, the local
-    # worker's shm dispatch) contending for the GIL under Python's default
-    # 5ms switch interval. Set before anything else spawns.
-    sys.setswitchinterval(0.0005)
     args = build_arg_parser().parse_args()
     err = _validate(args)
     if err:
