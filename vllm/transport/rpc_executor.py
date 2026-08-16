@@ -107,6 +107,7 @@ import collections
 import itertools
 import os
 import pickle
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -347,6 +348,26 @@ class TransportExecutor(MultiprocExecutor):
     """
 
     def _init_executor(self) -> None:
+        # 2026-08-16 GIL contention fix: real measurement found this - a
+        # payload-size-matched ping-pong test (2000 bytes, same synchronous
+        # request/reply pattern as the real RPC dispatch) still completed in
+        # ~1.3ms, matching the raw 4-byte baseline exactly. So the 20-50ms
+        # round trips actually observed under real load were NEVER the
+        # network or serialization - they were this process's OWN threads
+        # (per-link reader threads, per-link asyncio event loop threads,
+        # _combine_pool workers, all on top of the main EngineCore
+        # scheduling loop) fighting over the GIL. Python's default
+        # switchinterval is 5ms - suspiciously close to the delays actually
+        # measured. A thread that just got real work to do (a reader thread
+        # whose recv() queue just received a reply) can sit ready-but-not-
+        # scheduled for up to one switch interval if another thread holds
+        # the GIL, which is exactly the kind of latency this pipelining
+        # work is trying to hide. Shortening it trades a bit more GIL
+        # handoff overhead for much lower worst-case scheduling latency -
+        # the right trade for a process whose bottleneck is inter-thread
+        # response latency, not raw single-thread throughput. Set as early
+        # as possible, before any of this process's extra threads spawn.
+        sys.setswitchinterval(0.0005)
         # This call spawns this machine's own local TP workers (they connect
         # torch.distributed/initialize_model_parallel() with the REAL,
         # already-1 pipeline_parallel_size their launch command passed in -
