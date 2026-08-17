@@ -8,13 +8,16 @@ Usage: python3 chat_proxy.py [--upstream http://127.0.0.1:8081] [--port 8090]
 """
 import argparse
 import http.server
+import json
 import os
 import socketserver
 import sys
+import time
 import urllib.error
 import urllib.request
 
-HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_dashboard.html")
+HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_dashboard.html")
+CLIENT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_dashboard_client.log")
 
 
 def make_handler(upstream: str):
@@ -32,8 +35,24 @@ def make_handler(upstream: str):
         def do_POST(self):
             if self.path.startswith("/v1/"):
                 self._proxy("POST")
+            elif self.path == "/log":
+                self._client_log()
             else:
                 self.send_error(404)
+
+        def _client_log(self):
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {"raw": body.decode("utf-8", "replace")}
+            payload["_server_ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(CLIENT_LOG_PATH, "a") as f:
+                f.write(json.dumps(payload) + "\n")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _serve_html(self):
             with open(HTML_PATH, "rb") as f:

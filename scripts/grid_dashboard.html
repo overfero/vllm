@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>6x Concurrent Generation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-border: #2a313c;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --text-faint: #5b6472;
+    --accent: #4f8cff;
+    --accent-dim: #2c4a80;
+    --ok: #3fb950;
+    --busy: #d29922;
+    --err: #f85149;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    height: 100%;
+  }
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; border-bottom: 1px solid var(--panel-border);
+    background: var(--panel); flex-shrink: 0; gap: 20px; flex-wrap: wrap;
+  }
+  .title { font-size: 15px; font-weight: 650; }
+  .stats {
+    display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px;
+    color: var(--text-dim); font-variant-numeric: tabular-nums;
+  }
+  .stats b { color: var(--text); font-weight: 600; }
+  .stats .stat-label { color: var(--text-faint); margin-right: 4px; }
+
+  #runBtn {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 10px 22px; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: background 0.15s;
+  }
+  #runBtn:hover { background: #6ba0ff; }
+  #runBtn:disabled { background: var(--accent-dim); color: var(--text-faint); cursor: default; }
+
+  .grid {
+    flex: 1; min-height: 0; display: grid;
+    grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, 1fr);
+    gap: 10px; padding: 10px; overflow: auto;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
+    display: flex; flex-direction: column; min-height: 200px; overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; border-bottom: 1px solid var(--panel-border); flex-shrink: 0;
+  }
+  .task-label { font-size: 11.5px; font-weight: 600; color: var(--text-dim); }
+  .pill {
+    font-family: var(--mono); font-size: 10.5px; padding: 2px 8px; border-radius: 100px;
+    background: #21262d; color: var(--text-faint); display: flex; align-items: center; gap: 5px;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+  .pill.idle .dot { background: var(--text-faint); }
+  .pill.streaming { color: var(--busy); }
+  .pill.streaming .dot { background: var(--busy); animation: pulse 1s infinite ease-in-out; }
+  .pill.done { color: var(--ok); }
+  .pill.done .dot { background: var(--ok); }
+  .pill.error { color: var(--err); }
+  .pill.error .dot { background: var(--err); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  .prompt-line {
+    padding: 7px 12px; font-size: 11.5px; color: var(--text-faint);
+    border-bottom: 1px solid var(--panel-border); flex-shrink: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .output {
+    flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word; color: var(--text);
+  }
+  .output:empty::before { content: "waiting to run\2026"; color: var(--text-faint); }
+  .output .cursor { display: inline-block; width: 6px; height: 13px; background: var(--accent);
+    vertical-align: text-bottom; animation: pulse 0.8s infinite ease-in-out; margin-left: 1px; }
+
+  .panel-foot {
+    padding: 5px 12px; border-top: 1px solid var(--panel-border); flex-shrink: 0;
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-faint);
+    display: flex; justify-content: space-between; font-variant-numeric: tabular-nums;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title">6&times; concurrent generation</div>
+    <div class="stats">
+      <span><span class="stat-label">elapsed</span><b id="statElapsed">0.0s</b></span>
+      <span><span class="stat-label">total tokens</span><b id="statTokens">0</b></span>
+      <span><span class="stat-label">aggregate tok/s</span><b id="statAgg">0.0</b></span>
+      <span><span class="stat-label">done</span><b id="statDone">0/6</b></span>
+    </div>
+    <button id="runBtn">Run all 6</button>
+  </header>
+  <div class="grid" id="grid"></div>
+
+<script>
+const TASKS = [
+  { label: "code · palindrome check",
+    prompt: "Write a Python function that checks if a given string is a palindrome, ignoring spaces, punctuation, and capitalization." },
+  { label: "concept · hash tables",
+    prompt: "Explain what a hash table is and why it provides O(1) average-case lookup time." },
+  { label: "poetry · haiku",
+    prompt: "Write a haiku about a rainy morning in the mountains." },
+  { label: "math · word problem",
+    prompt: "A train travels 240 km in 3 hours, then speeds up and travels another 180 km in 1.5 hours. What is its average speed for the whole trip? Show your reasoning." },
+  { label: "debug · Python bug",
+    prompt: "Find and explain the bug in this Python code:\n\ndef add(a, b):\n    return a - b" },
+  { label: "translate · 3 languages",
+    prompt: "Translate the sentence 'The weather is beautiful today' into French, Spanish, and Japanese." },
+];
+
+const MODEL = "/data/stage2-checkpoint";
+
+const grid = document.getElementById("grid");
+const runBtn = document.getElementById("runBtn");
+const statElapsed = document.getElementById("statElapsed");
+const statTokens = document.getElementById("statTokens");
+const statAgg = document.getElementById("statAgg");
+const statDone = document.getElementById("statDone");
+
+const panels = TASKS.map((task, i) => {
+  const el = document.createElement("div");
+  el.className = "panel";
+  el.innerHTML = `
+    <div class="panel-head">
+      <span class="task-label">${task.label}</span>
+      <span class="pill idle" data-role="pill"><span class="dot"></span><span data-role="pillText">idle</span></span>
+    </div>
+    <div class="prompt-line" title="${task.prompt.replace(/"/g, "&quot;")}">${task.prompt.split("\n")[0]}</div>
+    <div class="output" data-role="output"></div>
+    <div class="panel-foot">
+      <span data-role="tokCount">0 tok</span>
+      <span data-role="tokRate">-- tok/s</span>
+      <span data-role="elapsed">--</span>
+    </div>`;
+  grid.appendChild(el);
+  return {
+    task, el, idx: i,
+    pill: el.querySelector('[data-role="pill"]'),
+    pillText: el.querySelector('[data-role="pillText"]'),
+    output: el.querySelector('[data-role="output"]'),
+    tokCount: el.querySelector('[data-role="tokCount"]'),
+    tokRate: el.querySelector('[data-role="tokRate"]'),
+    elapsed: el.querySelector('[data-role="elapsed"]'),
+  };
+});
+
+function setPill(p, state, text) {
+  p.pill.className = "pill " + state;
+  p.pillText.textContent = text;
+}
+
+function sendLog(data) {
+  try {
+    fetch("/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) { /* logging must never break the run */ }
+}
+
+let aggTimer = null;
+
+async function runPanel(p) {
+  setPill(p, "streaming", "streaming");
+  p.output.textContent = "";
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  p.output.appendChild(cursor);
+
+  const t0 = performance.now();
+  let tokenCount = 0;
+  let fullText = "";
+  let parseWarnings = 0;
+  let httpStatus = null;
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL, messages: [{ role: "user", content: p.task.prompt }],
+        temperature: 0.7, stream: true,
+      }),
+    });
+    httpStatus = resp.status;
+    if (!resp.ok || !resp.body) {
+      let bodyText = "";
+      try { bodyText = await resp.text(); } catch {}
+      throw new Error("HTTP " + resp.status + (bodyText ? " body=" + bodyText.slice(0, 300) : ""));
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (!trimmed.startsWith("data:")) { parseWarnings += 1; continue; }
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { parseWarnings += 1; continue; }
+        const delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+        const text = delta && delta.content;
+        if (text) {
+          tokenCount += 1;
+          fullText += text;
+          p.output.insertBefore(document.createTextNode(text), cursor);
+          p.output.scrollTop = p.output.scrollHeight;
+          const secs = (performance.now() - t0) / 1000;
+          p.tokCount.textContent = tokenCount + " tok";
+          p.tokRate.textContent = (tokenCount / Math.max(secs, 0.001)).toFixed(1) + " tok/s";
+          p.elapsed.textContent = secs.toFixed(1) + "s";
+          window.__gridTotalTokens += 1;
+        }
+      }
+    }
+    cursor.remove();
+    setPill(p, "done", "done");
+    sendLog({
+      event: "done", panel: p.idx, label: p.task.label, http_status: httpStatus,
+      token_count: tokenCount, parse_warnings: parseWarnings,
+      elapsed_s: (performance.now() - t0) / 1000,
+      final_text: fullText,
+    });
+  } catch (e) {
+    cursor.remove();
+    setPill(p, "error", "error");
+    p.output.textContent += "\n[error: " + e.message + "]";
+    sendLog({
+      event: "error", panel: p.idx, label: p.task.label, http_status: httpStatus,
+      token_count: tokenCount, parse_warnings: parseWarnings,
+      elapsed_s: (performance.now() - t0) / 1000,
+      error_name: e.name, error_message: e.message,
+      partial_text: fullText,
+    });
+  } finally {
+    window.__gridDoneCount += 1;
+    statDone.textContent = window.__gridDoneCount + "/" + panels.length;
+    if (window.__gridDoneCount === panels.length && aggTimer) {
+      clearInterval(aggTimer);
+      aggTimer = null;
+    }
+  }
+}
+
+runBtn.addEventListener("click", () => {
+  runBtn.disabled = true;
+  runBtn.textContent = "Running…";
+  window.__gridTotalTokens = 0;
+  window.__gridDoneCount = 0;
+  statTokens.textContent = "0";
+  statAgg.textContent = "0.0";
+  statDone.textContent = "0/" + panels.length;
+  statElapsed.textContent = "0.0s";
+
+  const runStart = performance.now();
+  if (aggTimer) clearInterval(aggTimer);
+  aggTimer = setInterval(() => {
+    const secs = (performance.now() - runStart) / 1000;
+    statElapsed.textContent = secs.toFixed(1) + "s";
+    statTokens.textContent = String(window.__gridTotalTokens);
+    statAgg.textContent = (window.__gridTotalTokens / Math.max(secs, 0.001)).toFixed(1);
+  }, 200);
+
+  Promise.all(panels.map(runPanel)).finally(() => {
+    runBtn.disabled = false;
+    runBtn.textContent = "Run all " + panels.length;
+  });
+});
+</script>
+</body>
+</html>

@@ -40,6 +40,8 @@ from __future__ import annotations
 import os
 import time
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -213,17 +215,65 @@ class TransportPPWorker(Worker):
         self_name = getattr(self, "_transport_timing_self_name", "?")
         if debug_timing:
             timing = get_transport_tensor_dict_timing()
-            recv_ms = timing["recv_ms"]
-            send_ms = timing["send_ms"]
-            compute_ms = total_ms - recv_ms - send_ms
+            recv_total_ms = (
+                timing["recv_network_ms"] + timing["recv_unpickle_ms"]
+                + timing["recv_deserialize_ms"] + timing["recv_h2d_copy_ms"]
+            )
+            send_total_ms = (
+                timing["send_cuda_sync_ms"] + timing["send_split_pickle_ms"]
+                + timing["send_d2h_copy_ms"] + timing["send_serialize_ms"]
+                + timing["send_network_ms"]
+            )
+            compute_ms = total_ms - recv_total_ms - send_total_ms
             logger.info(
-                "[STEP_BREAKDOWN] self=%s total_ms=%.2f recv_ms=%.2f "
-                "compute_ms=%.2f send_ms=%.2f",
-                self_name, total_ms, recv_ms, compute_ms, send_ms,
+                "[STEP_BREAKDOWN] self=%s total_ms=%.2f "
+                "recv_network_ms=%.2f recv_unpickle_ms=%.2f "
+                "recv_deserialize_ms=%.2f recv_h2d_copy_ms=%.2f "
+                "compute_ms=%.2f "
+                "send_cuda_sync_ms=%.2f send_split_pickle_ms=%.2f "
+                "send_d2h_copy_ms=%.2f send_serialize_ms=%.2f "
+                "send_network_ms=%.2f",
+                self_name, total_ms,
+                timing["recv_network_ms"], timing["recv_unpickle_ms"],
+                timing["recv_deserialize_ms"], timing["recv_h2d_copy_ms"],
+                compute_ms,
+                timing["send_cuda_sync_ms"], timing["send_split_pickle_ms"],
+                timing["send_d2h_copy_ms"], timing["send_serialize_ms"],
+                timing["send_network_ms"],
             )
         else:
             logger.info(
                 "[EXECUTE_MODEL_TIMING] self=%s duration_ms=%.2f",
+                self_name, total_ms,
+            )
+        return result
+
+    def sample_tokens(self, grammar_output):
+        # 2026-08-17: execute_model's own timing (above) only covers the
+        # forward pass + PP send/recv - it does NOT cover sample_tokens(),
+        # a genuinely separate Worker method (temperature/top-p/top-k or
+        # greedy selection from the last stage's lm_head logits) called
+        # right after. Real gap found live: summing every execute_model
+        # stage's total_ms across the whole A->B->C chain accounted for
+        # only ~37ms of a real, independently-measured 59.2ms per token -
+        # sample_tokens was one of the un-instrumented candidates for
+        # where the other ~22ms goes. Same "measure launch to real output,
+        # not just when Python returns" principle as execute_model's own
+        # send_cuda_sync_ms: sample_tokens can itself queue async GPU work
+        # (the actual sampling kernels) that doesn't necessarily finish by
+        # the time this call returns, so an explicit sync is taken right
+        # after to make sure the logged duration reflects when the result
+        # was actually ready, not just when Python got control back.
+        debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+        _t0 = time.monotonic() if debug_timing else None
+        result = super().sample_tokens(grammar_output)
+        if debug_timing:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_ms = (time.monotonic() - _t0) * 1000
+            self_name = getattr(self, "_transport_timing_self_name", "?")
+            logger.info(
+                "[SAMPLE_TOKENS_TIMING] self=%s duration_ms=%.2f",
                 self_name, total_ms,
             )
         return result

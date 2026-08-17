@@ -115,18 +115,41 @@ _DICT_HEADER = struct.Struct("!I")
 # (e.g. median(total) - median(recv) - median(send)) - invalid whenever the
 # underlying per-step samples aren't paired 1:1, which they weren't (each
 # stat came from its own separate aggregation pass). This accumulator
-# instead measures send/recv on the SAME step that produces the total
-# time, so a single log line can report a properly paired breakdown for
-# that one step: compute_ms = total_ms - recv_ms - send_ms, all three
-# numbers from the same execute_model() call. One process per TP rank
-# (real multiprocessing, not threads), so a plain module-level dict is
-# safe - no cross-rank sharing, no lock needed.
-_transport_tensor_dict_timing = {"send_ms": 0.0, "recv_ms": 0.0}
+# instead measures every sub-segment on the SAME step that produces the
+# total time, so a single log line can report a properly paired breakdown
+# for that one step. One process per TP rank (real multiprocessing, not
+# threads), so a plain module-level dict is safe - no cross-rank sharing,
+# no lock needed.
+#
+# Split into named segments, not just one "send_ms"/"recv_ms" blob -
+# first pass at this (just wrapping the whole send/recv call) found
+# "send" dominating (~13-15ms) with "compute" oddly tiny (~3ms), which
+# doesn't match physical intuition for a matmul-heavy forward pass. Real
+# suspect: `tensor.cpu()` inside send forces an implicit CUDA
+# synchronization - PyTorch ops are async by default, so a model's
+# forward() can return in Python/CPU wall-clock time well before its
+# queued GPU kernels actually finish; `.cpu()` is often the FIRST point
+# that actually blocks waiting for them. That would mean real compute
+# time was hiding inside the old undifferentiated "send_ms", not actually
+# fast - segmenting cuda_sync/d2h_copy/pickle/serialize/network_send
+# separately (send side) and network_recv/deserialize/h2d_copy (recv
+# side) is the only way to tell without guessing.
+_transport_tensor_dict_timing: dict[str, float] = {
+    "send_cuda_sync_ms": 0.0,
+    "send_split_pickle_ms": 0.0,
+    "send_d2h_copy_ms": 0.0,
+    "send_serialize_ms": 0.0,
+    "send_network_ms": 0.0,
+    "recv_network_ms": 0.0,
+    "recv_unpickle_ms": 0.0,
+    "recv_deserialize_ms": 0.0,
+    "recv_h2d_copy_ms": 0.0,
+}
 
 
 def reset_transport_tensor_dict_timing() -> None:
-    _transport_tensor_dict_timing["send_ms"] = 0.0
-    _transport_tensor_dict_timing["recv_ms"] = 0.0
+    for k in _transport_tensor_dict_timing:
+        _transport_tensor_dict_timing[k] = 0.0
 
 
 def get_transport_tensor_dict_timing() -> dict[str, float]:
@@ -160,47 +183,97 @@ def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
     from vllm.transport.tensor import serialize_tensor
 
     _debug_tensor_dict_stats("SEND", tensor_dict)
-    _t0 = time.perf_counter() if os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING") else None
-    metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-    header = pickle.dumps(metadata_list)
-    parts = [_DICT_HEADER.pack(len(header)), header]
-    for tensor in tensor_list:
-        payload = serialize_tensor(tensor.cpu() if tensor.device.type != "cpu" else tensor)
-        parts.append(_DICT_HEADER.pack(len(payload)))
-        parts.append(payload)
-    transport.send(b"".join(parts))
-    if _t0 is not None:
-        _transport_tensor_dict_timing["send_ms"] += (time.perf_counter() - _t0) * 1000
+    debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+
+    if debug_timing:
+        # Explicit sync FIRST, timed on its own - this is deliberately the
+        # very first thing that can block waiting for the model's queued
+        # GPU kernels to actually finish (CUDA ops are async; nothing
+        # before this point necessarily waited for them). Whatever time
+        # shows up here is real compute that was still running in the
+        # background, not send/network overhead.
+        _t0 = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _transport_tensor_dict_timing["send_cuda_sync_ms"] += (time.perf_counter() - _t0) * 1000
+
+        _t0 = time.perf_counter()
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        header = pickle.dumps(metadata_list)
+        _transport_tensor_dict_timing["send_split_pickle_ms"] += (time.perf_counter() - _t0) * 1000
+
+        parts = [_DICT_HEADER.pack(len(header)), header]
+        d2h_ms = 0.0
+        ser_ms = 0.0
+        for tensor in tensor_list:
+            _t0 = time.perf_counter()
+            cpu_tensor = tensor.cpu() if tensor.device.type != "cpu" else tensor
+            d2h_ms += (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
+            payload = serialize_tensor(cpu_tensor)
+            ser_ms += (time.perf_counter() - _t0) * 1000
+            parts.append(_DICT_HEADER.pack(len(payload)))
+            parts.append(payload)
+        _transport_tensor_dict_timing["send_d2h_copy_ms"] += d2h_ms
+        _transport_tensor_dict_timing["send_serialize_ms"] += ser_ms
+
+        _t0 = time.perf_counter()
+        transport.send(b"".join(parts))
+        _transport_tensor_dict_timing["send_network_ms"] += (time.perf_counter() - _t0) * 1000
+    else:
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        header = pickle.dumps(metadata_list)
+        parts = [_DICT_HEADER.pack(len(header)), header]
+        for tensor in tensor_list:
+            payload = serialize_tensor(tensor.cpu() if tensor.device.type != "cpu" else tensor)
+            parts.append(_DICT_HEADER.pack(len(payload)))
+            parts.append(payload)
+        transport.send(b"".join(parts))
 
 
 def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
     """Inverse of `_transport_send_tensor_dict`."""
     from vllm.transport.tensor import deserialize_tensor
 
-    _t0 = time.perf_counter() if os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING") else None
+    debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+    _t0 = time.perf_counter() if debug_timing else None
     data = transport.recv()
+    if _t0 is not None:
+        _transport_tensor_dict_timing["recv_network_ms"] += (time.perf_counter() - _t0) * 1000
+        _t0 = time.perf_counter()
     offset = 0
     (meta_len,) = _DICT_HEADER.unpack_from(data, offset)
     offset += _DICT_HEADER.size
     metadata_list = pickle.loads(data[offset : offset + meta_len])
     offset += meta_len
+    if _t0 is not None:
+        _transport_tensor_dict_timing["recv_unpickle_ms"] += (time.perf_counter() - _t0) * 1000
 
     result: dict[str, Any] = {}
+    deser_ms = 0.0
+    h2d_ms = 0.0
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
             (payload_len,) = _DICT_HEADER.unpack_from(data, offset)
             offset += _DICT_HEADER.size
             payload = data[offset : offset + payload_len]
             offset += payload_len
+            _t0 = time.perf_counter() if debug_timing else None
             tensor = deserialize_tensor(payload)
+            if _t0 is not None:
+                deser_ms += (time.perf_counter() - _t0) * 1000
+                _t0 = time.perf_counter()
             if value.device != "cpu":
                 tensor = tensor.to(value.device)
+            if _t0 is not None:
+                h2d_ms += (time.perf_counter() - _t0) * 1000
             result[key] = tensor
         else:
             result[key] = value
+    if debug_timing:
+        _transport_tensor_dict_timing["recv_deserialize_ms"] += deser_ms
+        _transport_tensor_dict_timing["recv_h2d_copy_ms"] += h2d_ms
     _debug_tensor_dict_stats("RECV", result)
-    if _t0 is not None:
-        _transport_tensor_dict_timing["recv_ms"] += (time.perf_counter() - _t0) * 1000
     return result
 
 

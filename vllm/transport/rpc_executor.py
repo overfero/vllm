@@ -558,6 +558,8 @@ class TransportExecutor(MultiprocExecutor):
         local_future = local_call()  # local_call itself passes non_block=True
 
         def _combine():
+            debug_timing = os.environ.get(_ENV_DEBUG_TIMING)
+            _t0 = time.perf_counter() if debug_timing else 0.0
             for link, fut, pipelined in pending:
                 try:
                     if pipelined:
@@ -567,6 +569,8 @@ class TransportExecutor(MultiprocExecutor):
                 except Exception:
                     logger.error("remote stage %s failed during %s", link.name, method)
                     raise
+            if debug_timing:
+                _t_remote_done = time.perf_counter()
             # 2026-08-15 microbatching fix: real crash hit running this for real
             # ("Bad address (src/fq.cpp:56)", a native libzmq fault - see
             # vllm/distributed/device_communicators/shm_broadcast.py, which
@@ -587,7 +591,18 @@ class TransportExecutor(MultiprocExecutor):
             # not vLLM's) stays fully concurrent across steps, since that
             # part was actually designed for it.
             with self._local_wait_lock:
-                return local_future.result()
+                result = local_future.result()
+            if debug_timing:
+                _t_local_done = time.perf_counter()
+                self_name = os.environ.get(_ENV_SELF_NAME, "?")
+                print(
+                    f"[COMBINE_TIMING] self={self_name} method={method} "
+                    f"remote_wait_ms={1000*(_t_remote_done-_t0):.2f} "
+                    f"local_wait_ms={1000*(_t_local_done-_t_remote_done):.2f} "
+                    f"total_ms={1000*(_t_local_done-_t0):.2f}",
+                    flush=True,
+                )
+            return result
 
         combined: Future = self._combine_pool.submit(_combine)
         return combined if non_block else combined.result()
@@ -667,14 +682,29 @@ class TransportExecutor(MultiprocExecutor):
         local_future = super(TransportExecutor, self).sample_tokens(grammar_output, non_block=True)
 
         def _combine():
+            debug_timing = os.environ.get(_ENV_DEBUG_TIMING)
+            _t0 = time.perf_counter() if debug_timing else 0.0
             for link, fut, method in pending:
                 try:
                     self._resolve_pipelined(link, method, fut)
                 except Exception:
                     logger.error("remote stage %s failed during %s", link.name, method)
                     raise
+            if debug_timing:
+                _t_remote_done = time.perf_counter()
             with self._local_wait_lock:
-                return local_future.result()
+                result = local_future.result()
+            if debug_timing:
+                _t_local_done = time.perf_counter()
+                self_name = os.environ.get(_ENV_SELF_NAME, "?")
+                print(
+                    f"[COMBINE_TIMING] self={self_name} method=fused "
+                    f"remote_wait_ms={1000*(_t_remote_done-_t0):.2f} "
+                    f"local_wait_ms={1000*(_t_local_done-_t_remote_done):.2f} "
+                    f"total_ms={1000*(_t_local_done-_t0):.2f}",
+                    flush=True,
+                )
+            return result
 
         combined: Future = self._combine_pool.submit(_combine)
         return combined if non_block else combined.result()
