@@ -39,6 +39,16 @@ class TransportConfig:
     stun_port: int = 19302
     connect_timeout: float = 60.0
 
+    # QUICTransport (also reuses signaling_url/udp_mode/udp_port/stun_*/
+    # connect_timeout/listen above - hole punch is shared with UDPTransport,
+    # see quic_transport.py's module docstring)
+    quic_idle_timeout: float = 45.0  # seconds with no traffic before the QUIC
+    # connection itself declares the peer dead (independent of, and a real
+    # improvement over, UDPTransport's total lack of dead-peer detection)
+    quic_max_message_bytes: int = 2 * 1024 * 1024 * 1024  # application-level
+    # cap on top of QUIC's own flow control - defense in depth, not relying
+    # solely on library defaults for this (see quic_transport.py)
+
     extra: dict = field(default_factory=dict)
 
 

@@ -55,3 +55,7 @@ opentelemetry-sdk >= 1.27.0
 opentelemetry-api >= 1.27.0
 opentelemetry-exporter-otlp >= 1.27.0
 opentelemetry-semantic-conventions-ai >= 0.4.1
+aioquic >= 1.3.0  # QUICTransport (vllm/transport/quic_transport.py) - reliable/
+# congestion-controlled/NAT-migration-tolerant transport for this project's
+# custom multi-machine pipeline-parallel activation-tensor exchange, layered
+# on top of the existing UDP hole-punch (udp_holepunch/peer.py)

@@ -121,7 +121,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--prev-name", default=None)
     p.add_argument("--next-name", default=None)
 
-    p.add_argument("--transport", choices=["tcp", "udp"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
     p.add_argument("--signaling-url", default=None)
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)
@@ -145,6 +145,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-gpu-blocks-override", type=int, required=True,
                     help="MUST match the value passed to the driver's launch_pp_stage.py "
                          "and every other stage_server.py - see rpc_executor.py")
+    p.add_argument("--kv-cache-dtype", default=None,
+                    help="Real vLLM EngineArgs flag (e.g. int8_per_token_head) - must "
+                         "match on every stage + the driver, same reasoning as "
+                         "--speculative-config: the driver's scheduler/dispatch sizing "
+                         "assumes a consistent per-token KV cache byte layout across "
+                         "the whole pipeline.")
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                    help="Real vLLM EngineArgs flag - must match on every stage + the "
+                         "driver for the same reason as --kv-cache-dtype/"
+                         "--speculative-config: the driver dispatches per-step batches "
+                         "sized against this value, and a mismatched stage can't "
+                         "allocate matching scratch buffers.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                     help="For hybrid Mamba/attention models (e.g. Qwen3.5): each decode "
                          "sequence needs its own dedicated Mamba cache block, so this MUST "
@@ -251,7 +263,7 @@ def _build_engine_core(args: argparse.Namespace):
         json.loads(args.speculative_config) if args.speculative_config else None
     )
 
-    engine_args = EngineArgs(
+    engine_kwargs = dict(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         pipeline_parallel_size=1,  # local-only; see launch_pp_stage.py's docstring
@@ -276,6 +288,16 @@ def _build_engine_core(args: argparse.Namespace):
         # multi-machine backing for - see launch_pp_stage.py's matching flag.
         async_scheduling=False,
     )
+    # kv_cache_dtype/max_num_batched_tokens default to a non-None literal
+    # ("auto" / a computed int) at the EngineArgs level - only override when
+    # the caller actually asked for one, to avoid clobbering that default
+    # with a bare None (which fails Literal-type validation).
+    if args.kv_cache_dtype is not None:
+        engine_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+    if args.max_num_batched_tokens is not None:
+        engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+
+    engine_args = EngineArgs(**engine_kwargs)
     vllm_config = engine_args.create_engine_config()
     return EngineCore(vllm_config=vllm_config, executor_class=MultiprocExecutor, log_stats=False)
 

@@ -95,6 +95,21 @@ def transport_config_pair(
                 self_id=id_b, peer_id=id_a, signaling_url=signaling_url, udp_mode="preserve", udp_port=base_port + 1
             ),
         )
+    if backend == "quic":
+        # Also needs signaling (hole punch is shared with udp - see
+        # quic_transport.py's module docstring) plus `listen` to pick TLS
+        # role: the listening side presents a certificate (QUIC "server").
+        assert signaling_url is not None
+        return (
+            TransportConfig(
+                self_id=id_a, peer_id=id_b, signaling_url=signaling_url, udp_mode="preserve",
+                udp_port=base_port, listen=True,
+            ),
+            TransportConfig(
+                self_id=id_b, peer_id=id_a, signaling_url=signaling_url, udp_mode="preserve",
+                udp_port=base_port + 1, listen=False,
+            ),
+        )
     raise ValueError(f"unknown backend {backend!r}")
 
 

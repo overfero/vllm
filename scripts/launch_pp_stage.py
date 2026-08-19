@@ -84,7 +84,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--next-name", default=None, help="next stage's machine name (omit for the last pp-rank)")
 
     # --- transport (vllm/transport/ - frozen, unmodified) ---
-    p.add_argument("--transport", choices=["tcp", "udp"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
     p.add_argument("--signaling-url", default=None, help="required for --transport udp")
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)
@@ -98,6 +98,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="float16")
     p.add_argument("--quantization", default=None, choices=[None, "awq", "gptq", "awq_marlin", "gptq_marlin"])
     p.add_argument("--max-model-len", type=int, default=None)
+    p.add_argument("--kv-cache-dtype", default=None,
+                    help="Real vLLM CLI flag (e.g. int8_per_token_head) - must match "
+                         "every scripts/stage_server.py's own --kv-cache-dtype too.")
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                    help="Real vLLM CLI flag - must match every scripts/stage_server.py's "
+                         "own --max-num-batched-tokens too (same reasoning as "
+                         "--speculative-config: the driver dispatches per-step batches "
+                         "sized against this value).")
+    p.add_argument("--enable-auto-tool-choice", action="store_true",
+                    help="Real vLLM CLI flag, driver/API-server-only - lets the model "
+                         "choose whether to call a tool vs answer directly.")
+    p.add_argument("--tool-call-parser", default=None,
+                    help="Real vLLM CLI flag, driver/API-server-only - required "
+                         "alongside --enable-auto-tool-choice for tool-call output to "
+                         "parse correctly (e.g. qwen3_xml for this model family).")
+    p.add_argument("--reasoning-parser", default=None,
+                    help="Real vLLM CLI flag, driver/API-server-only - separates "
+                         "<think>...</think> reasoning into its own response field "
+                         "instead of leaking it into visible text (e.g. qwen3).")
+    p.add_argument("--api-key", default=None,
+                    help="Real vLLM CLI flag, driver/API-server-only - requires "
+                         "'Authorization: Bearer <key>' on every request when set.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                     help="see stage_server.py's matching flag docstring - required <= "
                          "--num-gpu-blocks-override for hybrid Mamba models under CUDA graph")
@@ -145,6 +167,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "--enable-pipelining on all of them too).")
 
     # --- API server (only meaningful on the stage you expose to clients) ---
+    p.add_argument("--skip-mm-profiling", action="store_true",
+                    help="Real vLLM CLI flag - skip the multimodal encoder/encoder-cache "
+                         "memory-profiling dummy run at startup. Needed on a driver that "
+                         "accepts image/video input at the API layer (no "
+                         "--language-model-only) but isn't the first PP rank: this "
+                         "profiling pass calls the model's embed_multimodal() with a "
+                         "dummy batch regardless of PP rank, which crashes here since "
+                         "the vision tower was never constructed locally on a non-first "
+                         "rank (see qwen3_5.py's PP-rank-aware tower skip). Safe on this "
+                         "topology because the driver never runs the vision encoder "
+                         "itself anyway - only the first PP rank ever sees raw "
+                         "pixel_values, every later rank only receives forwarded hidden "
+                         "states, so there's no real encoder cache for this stage to "
+                         "size correctly in the first place.")
     p.add_argument("--serve", action="store_true", help="expose the OpenAI-compatible API on this machine")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
@@ -290,6 +326,20 @@ def main() -> int:
         cmd += ["--cpu-offload-gb", str(args.cpu_offload_gb)]
     if args.enable_expert_parallel:
         cmd += ["--enable-expert-parallel"]
+    if args.kv_cache_dtype:
+        cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
+    if args.max_num_batched_tokens:
+        cmd += ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
+    if args.enable_auto_tool_choice:
+        cmd += ["--enable-auto-tool-choice"]
+    if args.tool_call_parser:
+        cmd += ["--tool-call-parser", args.tool_call_parser]
+    if args.reasoning_parser:
+        cmd += ["--reasoning-parser", args.reasoning_parser]
+    if args.api_key:
+        cmd += ["--api-key", args.api_key]
+    if args.skip_mm_profiling:
+        cmd += ["--skip-mm-profiling"]
     if not args.serve:
         # Non-serving stages still need a real engine constructed (to load
         # their shard and connect their transport link(s)) - see the

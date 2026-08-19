@@ -169,7 +169,7 @@ def _stage(result_queue, backend: str, pp_rank: int, signaling_url: str | None, 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp"], default="udp")
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
     parser.add_argument("--tcp-port-base", type=int, default=36100)
     args = parser.parse_args()
 
@@ -187,7 +187,7 @@ def main() -> int:
 
     from _common import SignalingServer
 
-    signaling = SignalingServer() if args.transport == "udp" else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()

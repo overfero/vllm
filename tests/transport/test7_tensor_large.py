@@ -88,10 +88,10 @@ def _receiver(result_queue, backend: str, config: TransportConfig, sizes: list[i
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp"], required=True)
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], required=True)
     args = parser.parse_args()
 
-    signaling = SignalingServer() if args.transport == "udp" else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()

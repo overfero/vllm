@@ -32,6 +32,7 @@ import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -172,17 +173,25 @@ def _debug_tensor_dict_stats(prefix: str, tensor_dict: dict[str, Any]) -> None:
             )
 
 
-def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
-    """GroupCoordinator.send_tensor_dict's transport-backed path (see
-    vllm/transport/README.md, "Phase 4"). Reuses `_split_tensor_dict` (the
-    same key/TensorMetadata split the NCCL/gloo path uses) so the wire
-    format is: [pickled metadata_list][per-tensor: length-prefixed
-    serialize_tensor() payload, in tensor_list order]. CUDA tensors are
-    staged to host memory first - `Transport.send`/`recv` only ever move
-    `bytes` (see vllm/transport/tensor.py's D2H/H2D note)."""
+def _serialize_tensor_dict(tensor_dict: dict[str, Any]) -> bytes:
+    """The CUDA-stream-sensitive half of `_transport_send_tensor_dict`:
+    D2H copy + serialize into one flat payload, WITHOUT touching the
+    network. Split out on its own so `GroupCoordinator.isend_tensor_dict`
+    can run JUST this part synchronously, on the calling thread, before
+    handing the result to a background thread for the slow network call
+    (see that method) - `tensor.cpu()`'s implicit CUDA sync is only
+    correctly ordered against whatever stream produced `tensor_dict`'s
+    tensors if it runs on the calling thread; the real reason
+    `torch.distributed.isend`'s own real handles need
+    `tensor.record_stream(...)` right after issuing the send is exactly
+    this same hazard (a caller must not be able to overwrite a tensor's
+    GPU memory out from under an in-flight, not-yet-copied send). Handing
+    a background thread live CUDA tensors to copy out "whenever it gets
+    scheduled" would reopen that hazard; handing it only the already-
+    extracted bytes from this function cannot, since bytes don't reference
+    GPU memory at all."""
     from vllm.transport.tensor import serialize_tensor
 
-    _debug_tensor_dict_stats("SEND", tensor_dict)
     debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
 
     if debug_timing:
@@ -216,19 +225,41 @@ def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
             parts.append(payload)
         _transport_tensor_dict_timing["send_d2h_copy_ms"] += d2h_ms
         _transport_tensor_dict_timing["send_serialize_ms"] += ser_ms
+        return b"".join(parts)
 
+    metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+    header = pickle.dumps(metadata_list)
+    parts = [_DICT_HEADER.pack(len(header)), header]
+    for tensor in tensor_list:
+        payload = serialize_tensor(tensor.cpu() if tensor.device.type != "cpu" else tensor)
+        parts.append(_DICT_HEADER.pack(len(payload)))
+        parts.append(payload)
+    return b"".join(parts)
+
+
+def _transport_send_tensor_dict(transport, tensor_dict: dict[str, Any]) -> None:
+    """GroupCoordinator.send_tensor_dict's transport-backed path (see
+    vllm/transport/README.md, "Phase 4"). Reuses `_split_tensor_dict` (the
+    same key/TensorMetadata split the NCCL/gloo path uses) so the wire
+    format is: [pickled metadata_list][per-tensor: length-prefixed
+    serialize_tensor() payload, in tensor_list order]. CUDA tensors are
+    staged to host memory first - `Transport.send`/`recv` only ever move
+    `bytes` (see vllm/transport/tensor.py's D2H/H2D note). The D2H-copy-
+    and-serialize half lives in `_serialize_tensor_dict` above; this
+    function is just that plus the actual network send, for the fully-
+    synchronous caller (`send_tensor_dict`). `isend_tensor_dict`'s async
+    path calls `_serialize_tensor_dict` and `transport.send` itself,
+    separately, so only the network call runs on a background thread -
+    see that method for why."""
+    _debug_tensor_dict_stats("SEND", tensor_dict)
+    debug_timing = os.environ.get("VLLM_TRANSPORT_DEBUG_TIMING")
+    payload = _serialize_tensor_dict(tensor_dict)
+    if debug_timing:
         _t0 = time.perf_counter()
-        transport.send(b"".join(parts))
+        transport.send(payload)
         _transport_tensor_dict_timing["send_network_ms"] += (time.perf_counter() - _t0) * 1000
     else:
-        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        header = pickle.dumps(metadata_list)
-        parts = [_DICT_HEADER.pack(len(header)), header]
-        for tensor in tensor_list:
-            payload = serialize_tensor(tensor.cpu() if tensor.device.type != "cpu" else tensor)
-            parts.append(_DICT_HEADER.pack(len(payload)))
-            parts.append(payload)
-        transport.send(b"".join(parts))
+        transport.send(payload)
 
 
 def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
@@ -275,6 +306,25 @@ def _transport_recv_tensor_dict(transport) -> dict[str, Any]:
         _transport_tensor_dict_timing["recv_h2d_copy_ms"] += h2d_ms
     _debug_tensor_dict_stats("RECV", result)
     return result
+
+
+class _TransportHandle:
+    """Adapts a `concurrent.futures.Future` to the `Handle` protocol above
+    (`is_completed`/`wait`) - the same shape `torch.distributed.isend`/
+    `irecv`'s real handles already satisfy. Used only by
+    `GroupCoordinator.isend_tensor_dict`/`irecv_tensor_dict`'s transport-
+    backed branch; see those methods for why this exists."""
+
+    __slots__ = ("_future",)
+
+    def __init__(self, future: "Future") -> None:
+        self._future = future
+
+    def is_completed(self) -> bool:
+        return self._future.done()
+
+    def wait(self) -> None:
+        self._future.result()  # blocks until done; re-raises whatever the background call raised
 
 
 _group_name_counter: dict[str, int] = {}
@@ -1176,6 +1226,40 @@ class GroupCoordinator:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
 
+    def _transport_io_executor(self, kind: str) -> ThreadPoolExecutor:
+        """Lazily-created, backing `isend_tensor_dict`/`irecv_tensor_dict`'s
+        transport branch below. `kind` is `"send"` or `"recv"` - ONE
+        single-worker executor per direction, not a shared pool and not
+        more than one worker per direction:
+
+        - Must be `max_workers=1` per direction, not more: `QUICTransport`
+          uses a single persistent, strictly-ordered stream per direction
+          (see `quic_transport.py`'s `_on_stream_data` docstring - this
+          project already hit and fixed a real message-reordering bug once
+          from NOT preserving call order). A multi-worker pool could let
+          two `isend_tensor_dict` calls race each other onto the wire out
+          of the order they were actually issued in; a single worker makes
+          submission order == wire order again, the same guarantee the
+          fully-synchronous API already had.
+        - Must be per-DIRECTION, not one shared pool for both: send and
+          recv genuinely can and should overlap with each OTHER (that's
+          the whole point of this change) - sharing one single-worker pool
+          between them would serialize sends behind recvs and vice versa,
+          recreating the same blocking behavior this is meant to remove.
+
+        Lazy (attribute created on first use, not in `__init__`) because
+        `pipeline_bootstrap.py`'s synthetic transport-backed
+        `GroupCoordinator` is constructed via `object.__new__` (bypasses
+        `__init__` - see that module for why), so there is no single
+        constructor call site to hook.
+        """
+        attr = f"_transport_{kind}_pool"
+        pool = getattr(self, attr, None)
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"transport-pp-{kind}")
+            setattr(self, attr, pool)
+        return pool
+
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -1225,22 +1309,43 @@ class GroupCoordinator:
         all_gather_tensors: dict[str, bool] | None = None,
     ) -> list[Handle]:
         if self.transport is not None:
-            # Transport-backed PP has no async primitive of its own (the
-            # underlying send is a blocking socket write); do the work
-            # eagerly here and hand back an empty handle list so callers
-            # written against the async isend/irecv contract (real vLLM's
-            # Worker.execute_model, gpu_worker.py) still work unmodified -
-            # their `for handle in handles: handle.wait()` loop is then a
-            # no-op over an already-completed send. The all_gather_group
-            # sequence-parallel slicing optimization is intentionally not
-            # replicated here: it exists to cut NCCL traffic on a fast
-            # local link, which doesn't apply over this transport, and
-            # skipping it just means sending the full, unsharded tensor -
-            # correct, not bandwidth-optimal. Uses `transport_next` when set
-            # (middle-of-chain rank with two peers) else falls back to the
-            # single `transport` attribute (2-member case, unchanged).
-            _transport_send_tensor_dict(self.transport_next or self.transport, tensor_dict)
-            return []
+            # Genuinely non-blocking now (previously: ran eagerly on the
+            # caller's own thread and returned an empty handle list, so a
+            # caller written against the async isend/irecv contract - real
+            # vLLM's Worker.execute_model, gpu_worker.py - got no actual
+            # overlap: QUICTransport's own stream multiplexing/reliability
+            # was there, but the CALL SITE serialized everything anyway,
+            # the exact pipeline-bubble problem this was meant to solve
+            # (see the migration spec's audit finding #5). The actual
+            # blocking `transport.send()` work now runs on a dedicated
+            # background thread (`_transport_io_executor("send")`, see
+            # that method for why max_workers=1 and per-direction, not
+            # more/shared) so the caller can queue the NEXT micro-batch's
+            # compute immediately and only synchronize later via
+            # `handle.wait()`, the same as a real torch.distributed isend.
+            # The all_gather_group sequence-parallel slicing optimization
+            # is intentionally not replicated here: it exists to cut NCCL
+            # traffic on a fast local link, which doesn't apply over this
+            # transport, and skipping it just means sending the full,
+            # unsharded tensor - correct, not bandwidth-optimal. Uses
+            # `transport_next` when set (middle-of-chain rank with two
+            # peers) else falls back to the single `transport` attribute
+            # (2-member case, unchanged).
+            #
+            # `_serialize_tensor_dict` (D2H copy + serialize) runs
+            # SYNCHRONOUSLY, right here, on the caller's own thread -
+            # NOT inside the background thread - deliberately: see that
+            # function's docstring for why (the same CUDA-stream-ordering
+            # hazard real torch.distributed.isend's `record_stream` call
+            # exists to prevent). Only the resulting `bytes` - which don't
+            # reference GPU memory at all - are handed to the background
+            # thread, so the caller reusing tensor_dict's tensors for the
+            # next micro-batch right after this call returns is safe.
+            transport = self.transport_next or self.transport
+            _debug_tensor_dict_stats("SEND", tensor_dict)
+            payload = _serialize_tensor_dict(tensor_dict)
+            future = self._transport_io_executor("send").submit(transport.send, payload)
+            return [_TransportHandle(future)]
         if self.world_size <= 1:
             return []
 
@@ -1342,13 +1447,40 @@ class GroupCoordinator:
         list[Callable[[], None]],
     ]:
         if self.transport is not None:
-            # See the matching comment in isend_tensor_dict: the transport
-            # recv is blocking, so it's done eagerly and reported back as
-            # an already-complete async op (empty handles/postprocess).
+            # Genuinely non-blocking now - see the matching comment in
+            # isend_tensor_dict for the general motivation (real overlap,
+            # not just a reliable transport underneath a serializing call
+            # site). The whole blocking `_transport_recv_tensor_dict` call
+            # (network recv + deserialize + H2D copy) runs on a dedicated
+            # background thread (`_transport_io_executor("recv")` - a
+            # SEPARATE single-worker pool from "send", so a slow recv
+            # can't block a queued send or vice versa; see that method for
+            # why max_workers=1 matters for correctness, not just style).
             # Uses `transport_prev` when set (middle-of-chain rank with two
             # peers) else falls back to the single `transport` attribute.
-            tensor_dict = _transport_recv_tensor_dict(self.transport_prev or self.transport)
-            return tensor_dict, [], []
+            #
+            # Unlike the real NCCL path (which can pre-allocate empty
+            # tensors and hand back live references that get filled
+            # in-place once wait() returns, because it already knows
+            # shapes/dtypes from a separate, earlier recv_object() call),
+            # this transport gets metadata AND tensor data together in ONE
+            # message - there is nothing to allocate ahead of time. The
+            # returned `tensor_dict` therefore starts completely empty
+            # (not even non-tensor keys are present yet) and is filled via
+            # `postprocess`, in place, once `handle.wait()` has returned -
+            # exactly the same "do not touch tensor_dict before wait()"
+            # discipline every other caller of this API (including the
+            # all_gather branch below, in the real NCCL path) already
+            # requires, just extended to the dict's keys as well as its
+            # tensors' contents for this specific transport-backed case.
+            transport = self.transport_prev or self.transport
+            tensor_dict: dict[str, Any] = {}
+            future = self._transport_io_executor("recv").submit(_transport_recv_tensor_dict, transport)
+
+            def _fill_from_future(tensor_dict=tensor_dict, future=future) -> None:
+                tensor_dict.update(future.result())
+
+            return tensor_dict, [_TransportHandle(future)], [_fill_from_future]
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None, [], []
 

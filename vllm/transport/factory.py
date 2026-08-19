@@ -11,7 +11,7 @@ from __future__ import annotations
 import vllm.envs as envs
 from vllm.transport.base import Transport
 
-_KNOWN_BACKENDS = ("tcp", "udp")
+_KNOWN_BACKENDS = ("tcp", "udp", "quic")
 
 
 def get_transport(backend: str | None = None) -> Transport:
@@ -24,4 +24,8 @@ def get_transport(backend: str | None = None) -> Transport:
         from vllm.transport.udp_transport import UDPTransport
 
         return UDPTransport()
+    if name == "quic":
+        from vllm.transport.quic_transport import QUICTransport
+
+        return QUICTransport()
     raise ValueError(f"unknown transport backend {name!r}; available: {list(_KNOWN_BACKENDS)}")
