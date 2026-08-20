@@ -25,8 +25,8 @@ tensor/pipeline-parallel scheduling — see "Constraints honored" below.
 
 | File | What changed | Why |
 |---|---|---|
-| `vllm/envs.py` | Added `VLLM_TRANSPORT: Literal["tcp","udp"] = "tcp"` (type stub + `env_with_choices` runtime entry, next to `VLLM_WORKER_MULTIPROC_METHOD`) | Config-driven selection, per the requirement — follows the file's own existing pattern exactly, 4 lines total |
-| `vllm/config/parallel.py` | Added `TransportBackend = Literal["tcp","udp"]` alias and `transport_backend: TransportBackend = "tcp"` field (+docstring) on `ParallelConfig`, next to `master_addr`/`master_port` | Makes the backend a first-class, documented config field alongside the other distributed-runtime settings it will eventually sit next to |
+| `vllm/envs.py` | Added `VLLM_TRANSPORT: Literal["tcp","udp","quic"] = "tcp"` (type stub + `env_with_choices` runtime entry, next to `VLLM_WORKER_MULTIPROC_METHOD`) | Config-driven selection, per the requirement — follows the file's own existing pattern exactly, 4 lines total |
+| `vllm/config/parallel.py` | Added `TransportBackend = Literal["tcp","udp","quic"]` alias and `transport_backend: TransportBackend = "tcp"` field (+docstring) on `ParallelConfig`, next to `master_addr`/`master_port` | Makes the backend a first-class, documented config field alongside the other distributed-runtime settings it will eventually sit next to |
 | `vllm/engine/arg_utils.py` | Mirrored the field on `EngineArgs`, added `TransportBackend` to the import block, added one `parallel_group.add_argument("--transport", ...)` line, threaded `transport_backend=self.transport_backend` into the `ParallelConfig(...)` construction in `create_engine_config` | Gives `--transport {tcp,udp}` as a real CLI flag, following the exact `--master-addr`/`--master-port` precedent (same file, same pattern, same `get_kwargs()` auto-generation) |
 
 **Nothing else in vLLM was touched.** No changes to `vllm/distributed/`,

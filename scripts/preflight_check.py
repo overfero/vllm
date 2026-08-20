@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-name", required=True)
     p.add_argument("--prev-name", default=None)
     p.add_argument("--next-name", default=None)
-    p.add_argument("--transport", choices=["tcp", "udp"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
     p.add_argument("--signaling-url", default=None)
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)
@@ -83,9 +83,9 @@ def main() -> int:
         print("error: --next-name must be omitted iff --pp-rank is the last stage", file=sys.stderr)
         return 2
 
-    if args.transport == "udp":
+    if args.transport in ("udp", "quic"):
         if not args.signaling_url:
-            print("error: --signaling-url is required for --transport udp", file=sys.stderr)
+            print(f"error: --signaling-url is required for --transport {args.transport}", file=sys.stderr)
             return 2
         print(f"[preflight] checking signaling server at {args.signaling_url} ...")
         ok, detail = check_signaling_server(args.signaling_url, timeout=10.0)
