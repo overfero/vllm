@@ -529,17 +529,32 @@ class QUICTransport(Transport):
         self._keepalive_task = asyncio.create_task(self._keepalive_loop(protocol))
 
     async def _keepalive_loop(self, protocol: "_QuicAdapterProtocol") -> None:
-        # Reuses peer.py's own ping/pong (tags "P"/"O", untouched by our
-        # "\x01"-prefixed QUIC traffic) purely to keep the NAT pinhole
-        # fresh - the same reasoning UDPTransport's own keepalive loop
-        # documents. This is a different concern from QUIC's idle_timeout,
-        # which independently detects a genuinely dead peer regardless of
-        # whether the NAT mapping itself is still open.
+        # Two independent keepalive concerns, both handled here:
+        # 1. NAT pinhole freshness: reuses peer.py's own ping/pong (tags
+        #    "P"/"O", untouched by our "\x01"-prefixed QUIC traffic) - same
+        #    reasoning UDPTransport's own keepalive loop documents.
+        # 2. QUIC's OWN idle_timeout: a real QUIC PING is ALSO required,
+        #    separately - aioquic's `_close_at` deadline (the idle_timeout
+        #    clock) is only reset by an actual QUIC-tagged packet it
+        #    successfully decrypts (`QuicConnection._payload_received` in
+        #    aioquic/quic/connection.py, called from `receive_datagram`).
+        #    The hole-punch ping above does NOT count - it's not
+        #    `_QUIC_TAG`-prefixed, so it never reaches `receive_datagram`
+        #    at all. Without a real QUIC PING too, a genuinely idle link
+        #    (e.g. an inference server with no request traffic for longer
+        #    than quic_idle_timeout) would have aioquic kill the
+        #    connection on its own, even though both peers and the NAT
+        #    mapping are still perfectly alive - a real bug found while
+        #    preparing this transport for an actual multi-machine
+        #    deployment, not a theoretical one.
         seq = 0
         while True:
             await asyncio.sleep(_KEEPALIVE_INTERVAL_SECONDS)
             seq += 1
             protocol.send(_hp.pack_ping(seq, time.monotonic()))
+            if protocol._quic is not None and protocol.closed_exc is None:
+                protocol._quic.send_ping(seq)
+                protocol._transmit()
 
     def send(self, data: bytes) -> None:
         if self._loop is None or self._quic is None:

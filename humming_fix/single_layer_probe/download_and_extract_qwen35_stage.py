@@ -34,8 +34,8 @@ import shutil
 import subprocess
 import sys
 
-REPO = "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4"
-NUM_HIDDEN_LAYERS = 48
+DEFAULT_REPO = "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4"
+DEFAULT_NUM_HIDDEN_LAYERS = 48
 LAYER_PREFIX_TMPL = "model.language_model.layers.{i}."
 GLOBAL_KEYS = {
     "lm_head.weight",
@@ -50,8 +50,8 @@ META_FILES = [
 ]
 
 
-def hf_download(checkpoint_dir: str, includes: list[str]) -> None:
-    cmd = ["hf", "download", REPO, "--local-dir", checkpoint_dir]
+def hf_download(repo: str, checkpoint_dir: str, includes: list[str]) -> None:
+    cmd = ["hf", "download", repo, "--local-dir", checkpoint_dir]
     for pat in includes:
         cmd += ["--include", pat]
     print(f"downloading {len(includes)} file patterns to {checkpoint_dir}...")
@@ -63,6 +63,11 @@ def main() -> int:
     ap.add_argument("--start", type=int, required=True)
     ap.add_argument("--end", type=int, required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--repo", default=DEFAULT_REPO,
+                     help="any GPTQ checkpoint sharing Qwen3.5's key layout - real, "
+                          "measured working example: Vishva007/Qwen3.8-27B-W4A16-AutoRound-GPTQ "
+                          "(architectures=Qwen3_5ForConditionalGeneration, 64 layers)")
+    ap.add_argument("--num-layers", type=int, default=DEFAULT_NUM_HIDDEN_LAYERS)
     ap.add_argument("--checkpoint-dir", default="/data/models/qwen3.5-122b-a10b-gptq")
     ap.add_argument("--include-globals", action="store_true", default=False)
     ap.add_argument("--include-mtp", action="store_true", default=False,
@@ -77,10 +82,10 @@ def main() -> int:
     args = ap.parse_args()
 
     assert not args.out.startswith("/kaggle/working"), "large checkpoint output must not go under /kaggle/working"
-    assert 0 <= args.start < args.end <= NUM_HIDDEN_LAYERS
+    assert 0 <= args.start < args.end <= args.num_layers
 
     # step 1: metadata only
-    hf_download(args.checkpoint_dir, META_FILES)
+    hf_download(args.repo, args.checkpoint_dir, META_FILES)
 
     # step 2: compute needed shards
     with open(os.path.join(args.checkpoint_dir, "model.safetensors.index.json")) as f:
@@ -93,10 +98,11 @@ def main() -> int:
     if args.include_mtp:
         keep_keys += [k for k in weight_map if k.startswith("mtp.")]
     needed_shards = sorted(set(weight_map[k] for k in keep_keys))
-    print(f"stage [{args.start},{args.end}) needs {len(needed_shards)}/39 shards")
+    total_shards = len(set(weight_map.values()))
+    print(f"stage [{args.start},{args.end}) needs {len(needed_shards)}/{total_shards} shards")
 
     # step 3: selective download of just those shards
-    hf_download(args.checkpoint_dir, needed_shards)
+    hf_download(args.repo, args.checkpoint_dir, needed_shards)
 
     # step 4: extract (reuse the same logic as extract_stage_checkpoint_qwen35.py)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
