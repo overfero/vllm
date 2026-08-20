@@ -142,6 +142,25 @@ def main() -> None:
     # extract_stage_checkpoint.py's --renumber docstring for why: vLLM's
     # make_layers() slices [start_layer,end_layer) using pp_rank/world_size
     # against the TRUE global num_hidden_layers).
+    if args.include_mtp:
+        # Real bug hit TWICE now on two different checkpoints of this same
+        # architecture family (first on an earlier Akun2 deployment, again
+        # here): the source config.json's quantization_config.dynamic marks
+        # ALL "mtp.*" tensors as GPTQ-quantized ("+:.*mtp.*"), but
+        # mtp.*.mlp.down_proj is NOT actually quantized in the checkpoint -
+        # it has a plain .weight tensor, not
+        # .qweight/.qzeros/.scales/.g_idx. Without this exclusion,
+        # AutoGPTQLinearMethod's weight loader looks for
+        # 'layers.0.mlp.down_proj.weight' and errors with "no module or
+        # parameter named ... available parameters ... {qweight, qzeros,
+        # scales, g_idx}" the moment the drafter model tries to load it.
+        # Adding a more-specific "-:" (exclude) rule AFTER the general
+        # "+:.*mtp.*" one fixes it (confirmed working this same way on an
+        # earlier Akun2 deployment) - appended, not prepended, to actually
+        # override the general rule for this one case.
+        dynamic = config.get("quantization_config", {}).get("dynamic")
+        if dynamic is not None:
+            dynamic[r"-:.*mtp.*mlp\.down_proj.*"] = {}
     print(f"wrote config.json (REAL PP-STAGE mode: "
           f"num_hidden_layers={config['text_config']['num_hidden_layers']} unchanged, "
           f"original layer numbering [{args.start},{args.end}) kept, vision_config kept for __init__)")
