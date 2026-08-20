@@ -211,7 +211,19 @@ def establish_pp_transports(
             "(next_name must be None iff pp_rank==pp_world_size-1)"
         )
 
+    import vllm.envs as envs
     from vllm.transport import TransportConfig, get_transport
+
+    # Real bug hit wiring this up: `backend` here defaults to None (every
+    # real caller - pp_worker.py's TransportPPWorker - never passes it
+    # explicitly, relying on `get_transport()`'s own env-var fallback), so
+    # checking `backend == "quic-shared"` directly always saw None/""
+    # even when VLLM_TRANSPORT=quic-shared was correctly set - fell
+    # through to the plain UDP/QUIC TransportConfig shape instead, which
+    # QuicMultiplexedTransport.connect() then rejected outright (missing
+    # `extra`). Resolve the EFFECTIVE backend the exact same way
+    # `get_transport()` itself does, not just the raw parameter.
+    effective_backend = (backend or envs.VLLM_TRANSPORT).lower()
 
     def _connect(
         peer_name: str, is_prev: bool, tcp_connect_host: str | None
@@ -225,6 +237,36 @@ def establish_pp_transports(
         we_listen = not is_prev
 
         transport = get_transport(backend)
+
+        if effective_backend == "quic-shared":
+            # No hole-punch/handshake happens here at all - the real QUIC
+            # connection to `peer_name` is owned by a separate
+            # `quic_broker_daemon` process (started ahead of this one by
+            # stage_server.py/launch_pp_stage.py - see those modules'
+            # `_maybe_start_quic_broker_daemon`), already multiplexing
+            # every channel to that peer. This just connects to that
+            # daemon's local Unix socket and asks for this rank's own
+            # channel - see quic_broker.py's module docstring for the
+            # full design. `connect_timeout` here bounds ONLY the local
+            # socket retry loop (see QuicMultiplexedTransport.connect()),
+            # not any network hole-punch, so it does not need to be as
+            # generous as the daemon's own - but is kept equal so a
+            # slow-to-start daemon (e.g. one still mid hole-punch) doesn't
+            # make this worker give up first.
+            from vllm.transport.quic_broker import broker_socket_path
+
+            config = TransportConfig(
+                self_id=self_id,
+                peer_id=peer_id,
+                connect_timeout=connect_timeout,
+                extra={
+                    "broker_socket_path": broker_socket_path(self_name, peer_name),
+                    "channel": f"tp{local_rank}",
+                },
+            )
+            transport.connect(config)
+            return transport
+
         port_offset = local_rank * 2 + (0 if is_prev else 1)
         config = TransportConfig(
             self_id=self_id,

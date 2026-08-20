@@ -111,6 +111,75 @@ _STATUS_OK = "ok"
 _STATUS_ERROR = "error"
 
 
+def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> list:
+    """For `--transport quic-shared`: starts one `quic_broker_daemon`
+    subprocess per DISTINCT peer this stage talks to (its PP prev/next
+    neighbor(s) and the driver, deduplicated - for this project's real
+    2-machine deployments that's exactly one peer, one daemon), and
+    blocks until each daemon's local Unix-socket listener is confirmed
+    up (via `--ready-file`) before returning - so the PP transport
+    connect and RPC link open that happen right after this call never
+    race a daemon that hasn't started listening yet.
+
+    Returns the list of `subprocess.Popen` handles (callers should keep
+    a reference so the daemons aren't reaped as zombies, though they are
+    NOT waited on/terminated here - they're meant to outlive this
+    process's own transport connect calls and keep running for the
+    stage's whole lifetime; real cleanup is "the container/job ends").
+    Started with `start_new_session=True` so a daemon survives even if
+    this project's OTHER launcher (`launch_pp_stage.py`) execs into
+    `vllm serve` right after calling this same helper - see
+    `quic_broker_daemon.py`'s module docstring for why that matters.
+    """
+    if args.transport != "quic-shared":
+        return []
+
+    import subprocess
+    import tempfile
+
+    peers = []
+    for name, listen in ((args.next_name, True), (args.prev_name, False), (args.driver_name, True)):
+        if name and name not in [p for p, _ in peers]:
+            peers.append((name, listen))
+
+    procs = []
+    for i, (peer_name, listen) in enumerate(peers):
+        ready_fd, ready_path = tempfile.mkstemp(prefix="quic_broker_ready_")
+        os.close(ready_fd)
+        os.remove(ready_path)
+        cmd = [
+            sys.executable, "-m", "vllm.transport.quic_broker_daemon",
+            "--self-id", args.self_name, "--peer-id", peer_name,
+            "--signaling-url", args.signaling_url,
+            "--udp-port", str(args.udp_port_base + i),
+            "--connect-timeout", str(args.transport_connect_timeout),
+            "--ready-file", ready_path,
+        ]
+        if listen:
+            cmd.append("--listen")
+        print(f"[stage_server] starting quic_broker_daemon for peer {peer_name!r}: "
+              f"{' '.join(cmd)}", file=sys.stderr, flush=True)
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        procs.append(proc)
+
+        deadline = time.monotonic() + args.transport_connect_timeout + 30.0
+        while not os.path.exists(ready_path):
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"quic_broker_daemon for peer {peer_name!r} exited early "
+                    f"(code={proc.returncode}) before becoming ready"
+                )
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"quic_broker_daemon for peer {peer_name!r} did not become "
+                    f"ready within {args.transport_connect_timeout + 30.0}s"
+                )
+            time.sleep(0.2)
+        print(f"[stage_server] quic_broker_daemon for peer {peer_name!r} ready",
+              file=sys.stderr, flush=True)
+    return procs
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
@@ -121,7 +190,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--prev-name", default=None)
     p.add_argument("--next-name", default=None)
 
-    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-shared"], default="udp")
     p.add_argument("--signaling-url", default=None)
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)
@@ -229,8 +298,8 @@ def _validate(args: argparse.Namespace) -> str | None:
         return "--prev-name must be omitted iff --pp-rank is 0"
     if (args.next_name is None) != (args.pp_rank == args.pp_world_size - 1):
         return "--next-name must be omitted iff --pp-rank is the last stage"
-    if args.transport == "udp" and not args.signaling_url:
-        return "--signaling-url is required for --transport udp"
+    if args.transport in ("udp", "quic", "quic-shared") and not args.signaling_url:
+        return f"--signaling-url is required for --transport {args.transport}"
     return None
 
 
@@ -308,6 +377,25 @@ def _open_driver_rpc_link(args: argparse.Namespace):
     self_id = f"{args.self_name}-rpc-to-{args.driver_name}"
     peer_id = f"{args.driver_name}-rpc-to-{args.self_name}"
     transport = get_transport(args.transport)
+    if args.transport == "quic-shared":
+        # Same per-peer QuicBroker connection the PP tensor link(s)
+        # already use (started before this process's own EngineCore -
+        # see main()'s _maybe_start_quic_broker_daemon call) - the RPC
+        # control channel is just one more named channel on it.
+        from vllm.transport.quic_broker import broker_socket_path
+
+        transport.connect(
+            TransportConfig(
+                self_id=self_id,
+                peer_id=peer_id,
+                connect_timeout=args.transport_connect_timeout,
+                extra={
+                    "broker_socket_path": broker_socket_path(args.self_name, args.driver_name),
+                    "channel": "rpc",
+                },
+            )
+        )
+        return transport
     transport.connect(
         TransportConfig(
             self_id=self_id,
@@ -409,6 +497,8 @@ def main() -> int:
           f"prev={args.prev_name} next={args.next_name} driver={args.driver_name} "
           f"transport={args.transport} num_gpu_blocks_override={args.num_gpu_blocks_override}",
           file=sys.stderr)
+
+    _quic_broker_daemons = _maybe_start_quic_broker_daemons(args)  # noqa: F841 - keep refs alive
 
     print("[stage_server] building EngineCore (load_model + kv cache init + PP transport "
           "connect happen here)...", file=sys.stderr, flush=True)

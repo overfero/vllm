@@ -313,19 +313,39 @@ def _connect_remote_stages(pipelined: bool = False) -> list[_RemoteStageLink]:
             local_rpc_port,
         )
         transport = get_transport()
-        transport.connect(
-            TransportConfig(
-                self_id=self_id,
-                peer_id=peer_id,
-                host=host,
-                port=rpc_port,
-                listen=False,  # driver always connects; stage_server always listens
-                signaling_url=signaling_url or "http://127.0.0.1:8000",
-                udp_mode="preserve",
-                udp_port=local_rpc_port,
-                connect_timeout=connect_timeout,
+        if envs.VLLM_TRANSPORT == "quic-shared":
+            # Same shared-QUIC-connection design as the PP tensor links
+            # (see pipeline_bootstrap.py's establish_pp_transports) - this
+            # RPC control channel is just one more named channel on the
+            # SAME per-peer QuicBroker connection, not a separate
+            # hole-punch/handshake of its own.
+            from vllm.transport.quic_broker import broker_socket_path
+
+            transport.connect(
+                TransportConfig(
+                    self_id=self_id,
+                    peer_id=peer_id,
+                    connect_timeout=connect_timeout,
+                    extra={
+                        "broker_socket_path": broker_socket_path(self_name, remote_name),
+                        "channel": "rpc",
+                    },
+                )
             )
-        )
+        else:
+            transport.connect(
+                TransportConfig(
+                    self_id=self_id,
+                    peer_id=peer_id,
+                    host=host,
+                    port=rpc_port,
+                    listen=False,  # driver always connects; stage_server always listens
+                    signaling_url=signaling_url or "http://127.0.0.1:8000",
+                    udp_mode="preserve",
+                    udp_port=local_rpc_port,
+                    connect_timeout=connect_timeout,
+                )
+            )
         logger.info("TransportExecutor: RPC control channel to %s connected", remote_name)
         link = _RemoteStageLink(name=remote_name, transport=transport, timeout=connect_timeout)
         if pipelined:

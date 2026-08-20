@@ -70,7 +70,83 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
+
+
+def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> None:
+    """Driver-side counterpart of stage_server.py's function of the same
+    name - see that one's docstring for the full rationale. The role
+    (`--listen` or not) assigned to each peer here must be the mirror
+    image of whatever the PEER machine's own daemon uses for the SAME
+    connection, since exactly one side of a QUIC connection must present
+    a TLS certificate (`--listen`) and the other must not - prev-link
+    peers get `listen=False` here (this driver is always the higher-rank/
+    connecting side of its prev link, matching pipeline_bootstrap.py's
+    own `we_listen = not is_prev` convention for every other backend),
+    next-link peers get `listen=True` (mirrors the non-driver stage on
+    the other end using stage_server.py, which listens toward ITS
+    next-link peer - only relevant if this driver is not the last rank),
+    and every `--remote-stage-names` RPC target gets `listen=False` (the
+    driver always connects for the RPC control channel, matching
+    rpc_executor.py's own pre-existing `listen=False`).
+
+    Deliberately started here, BEFORE `os.execvpe()` replaces this
+    process - see `quic_broker_daemon.py`'s module docstring for why a
+    thread-based broker wouldn't survive that exec, and why this spawns
+    a real detached subprocess instead.
+    """
+    if args.transport != "quic-shared":
+        return
+
+    import subprocess
+    import tempfile
+
+    remote_names = (
+        [n.strip() for n in args.remote_stage_names.split(",") if n.strip()]
+        if args.remote_stage_names else []
+    )
+    peers = []
+    for name, listen in ((args.prev_name, False), (args.next_name, True)):
+        if name and name not in [p for p, _ in peers]:
+            peers.append((name, listen))
+    for name in remote_names:
+        if name not in [p for p, _ in peers]:
+            peers.append((name, False))
+
+    for i, (peer_name, listen) in enumerate(peers):
+        ready_fd, ready_path = tempfile.mkstemp(prefix="quic_broker_ready_")
+        os.close(ready_fd)
+        os.remove(ready_path)
+        cmd = [
+            sys.executable, "-m", "vllm.transport.quic_broker_daemon",
+            "--self-id", args.self_name, "--peer-id", peer_name,
+            "--signaling-url", args.signaling_url,
+            "--udp-port", str(args.udp_port_base + i),
+            "--connect-timeout", str(args.transport_connect_timeout),
+            "--ready-file", ready_path,
+        ]
+        if listen:
+            cmd.append("--listen")
+        print(f"[launch_pp_stage] starting quic_broker_daemon for peer {peer_name!r}: "
+              f"{' '.join(cmd)}", file=sys.stderr, flush=True)
+        proc = subprocess.Popen(cmd, start_new_session=True)
+
+        deadline = time.monotonic() + args.transport_connect_timeout + 30.0
+        while not os.path.exists(ready_path):
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"quic_broker_daemon for peer {peer_name!r} exited early "
+                    f"(code={proc.returncode}) before becoming ready"
+                )
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"quic_broker_daemon for peer {peer_name!r} did not become "
+                    f"ready within {args.transport_connect_timeout + 30.0}s"
+                )
+            time.sleep(0.2)
+        print(f"[launch_pp_stage] quic_broker_daemon for peer {peer_name!r} ready",
+              file=sys.stderr, flush=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -84,7 +160,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--next-name", default=None, help="next stage's machine name (omit for the last pp-rank)")
 
     # --- transport (vllm/transport/ - frozen, unmodified) ---
-    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-shared"], default="udp")
     p.add_argument("--signaling-url", default=None, help="required for --transport udp")
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)
@@ -224,8 +300,8 @@ def main() -> int:
     if (args.next_name is None) != (args.pp_rank == args.pp_world_size - 1):
         print("error: --next-name must be omitted iff --pp-rank is the last stage", file=sys.stderr)
         return 2
-    if args.transport == "udp" and not args.signaling_url:
-        print("error: --signaling-url is required for --transport udp", file=sys.stderr)
+    if args.transport in ("udp", "quic", "quic-shared") and not args.signaling_url:
+        print(f"error: --signaling-url is required for --transport {args.transport}", file=sys.stderr)
         return 2
     if args.remote_stage_names and args.num_gpu_blocks_override is None:
         print("error: --num-gpu-blocks-override is required when --remote-stage-names is "
@@ -359,6 +435,8 @@ def main() -> int:
     if args.dry_run:
         print("[launch_pp_stage] --dry-run: not executing", file=sys.stderr)
         return 0
+
+    _maybe_start_quic_broker_daemons(args)
 
     os.execvpe(cmd[0], cmd, env)
     return 0  # unreachable - execvpe replaces this process on success

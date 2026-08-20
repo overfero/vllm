@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-name", required=True)
     p.add_argument("--prev-name", default=None)
     p.add_argument("--next-name", default=None)
-    p.add_argument("--transport", choices=["tcp", "udp", "quic"], default="udp")
+    p.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-shared"], default="udp")
     p.add_argument("--signaling-url", default=None)
     p.add_argument("--udp-port-base", type=int, default=30000)
     p.add_argument("--tcp-port-base", type=int, default=30000)

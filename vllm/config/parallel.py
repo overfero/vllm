@@ -38,7 +38,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
-TransportBackend = Literal["tcp", "udp", "quic"]
+TransportBackend = Literal["tcp", "udp", "quic", "quic-shared"]
 """Worker-to-worker transport backend, resolved via vllm.transport.get_transport()."""
 EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
 All2AllBackend = Literal[
