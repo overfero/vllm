@@ -13,8 +13,11 @@ Verifies, end to end through the real local Unix-socket IPC hop
   2. Per-channel message ORDER is preserved (matches quic_transport.py's
      own single-ordered-stream-per-direction guarantee, now per channel).
   3. All channels genuinely share one underlying QUIC connection (checked
-     directly: each side's `QuicBroker` has exactly one `_quic`
-     QuicConnection object backing every channel).
+     directly: each side's `QuicBroker` has exactly one `_driver`
+     [`PyMultiplexedConnectionDriver`] object backing every channel - the
+     Rust-native equivalent of the old aioquic-era `_quic` attribute this
+     test used to inspect before the broker was rewritten to be
+     Rust-native end to end, see quic_broker.py's module docstring).
   4. Every message survives a close() immediately after the last send -
      see `QuicBroker._close_async`'s docstring for the real, qlog-found
      premature-close bug this guards against (closing right after the
@@ -92,7 +95,7 @@ def _machine_side(result_queue, self_id: str, peer_id: str, signaling_url: str, 
     for t in threads:
         t.join(timeout=60)
 
-    quic_conn_id = id(broker._quic)
+    quic_conn_id = id(broker._driver)
     broker.close()
 
     result_queue.put({

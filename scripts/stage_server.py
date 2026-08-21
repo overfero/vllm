@@ -133,6 +133,7 @@ def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> list:
     """
     if args.transport != "quic-shared":
         return []
+    daemon_module = "vllm.transport.quic_broker_daemon"
 
     import subprocess
     import tempfile
@@ -148,7 +149,7 @@ def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> list:
         os.close(ready_fd)
         os.remove(ready_path)
         cmd = [
-            sys.executable, "-m", "vllm.transport.quic_broker_daemon",
+            sys.executable, "-m", daemon_module,
             "--self-id", args.self_name, "--peer-id", peer_name,
             "--signaling-url", args.signaling_url,
             "--udp-port", str(args.udp_port_base + i),
@@ -378,10 +379,10 @@ def _open_driver_rpc_link(args: argparse.Namespace):
     peer_id = f"{args.driver_name}-rpc-to-{args.self_name}"
     transport = get_transport(args.transport)
     if args.transport == "quic-shared":
-        # Same per-peer QuicBroker connection the PP tensor link(s)
-        # already use (started before this process's own EngineCore -
-        # see main()'s _maybe_start_quic_broker_daemon call) - the RPC
-        # control channel is just one more named channel on it.
+        # Same per-peer broker connection the PP tensor link(s) already
+        # use (started before this process's own EngineCore - see main()'s
+        # _maybe_start_quic_broker_daemon call) - the RPC control channel
+        # is just one more named channel on it.
         from vllm.transport.quic_broker import broker_socket_path
 
         transport.connect(

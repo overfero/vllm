@@ -55,10 +55,10 @@ def _worker(result_queue, backend: str, config: TransportConfig, role: str, my_s
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], required=True)
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-rs"], required=True)
     args = parser.parse_args()
 
-    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic", "quic-rs") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()

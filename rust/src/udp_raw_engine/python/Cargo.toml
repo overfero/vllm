@@ -1,0 +1,17 @@
+[package]
+name = "vllm-udp-raw-engine-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_rust_udp_raw_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc.workspace = true
+pyo3.workspace = true
+vllm-udp-raw-engine.workspace = true
+
+[lints]
+workspace = true

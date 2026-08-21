@@ -121,16 +121,16 @@ def _receiver(result_queue, backend: str, config: TransportConfig) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], default="quic")
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-rs"], default="quic")
     args = parser.parse_args()
-    if args.transport != "quic":
-        print(f"NOTE: this test exercises aioquic's own loss-recovery/congestion control - "
-              f"running with --transport {args.transport} anyway will exercise that backend's "
-              f"OWN reliability layer instead (udp_transport.py's hand-rolled retry logic, or "
-              f"TCP's kernel-level retransmission), which is a different (and, for udp, weaker) "
-              f"code path than what this test was written to validate.")
+    if args.transport not in ("quic", "quic-rs"):
+        print(f"NOTE: this test exercises a real QUIC stack's own loss-recovery/congestion "
+              f"control - running with --transport {args.transport} anyway will exercise that "
+              f"backend's OWN reliability layer instead (udp_transport.py's hand-rolled retry "
+              f"logic, or TCP's kernel-level retransmission), which is a different (and, for "
+              f"udp, weaker) code path than what this test was written to validate.")
 
-    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic", "quic-rs") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()

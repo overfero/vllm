@@ -21,10 +21,38 @@ def get_transport(backend: str | None = None) -> Transport:
 
         return TCPTransport()
     if name == "udp":
-        from vllm.transport.udp_transport import UDPTransport
+        # Rust-native data path (vllm._rust_udp_raw_engine's send_message/
+        # recv_message - sendmmsg/recvmmsg batching, real Go-Back-N
+        # retransmission, msg_id-disambiguated streaming) over the same
+        # peer.py hole-punch/STUN/keepalive machinery the old aioquic-era
+        # UDPTransport used - see udp_rs_transport.py's module docstring
+        # and the project_raw_udp_rs_production_readiness memory entry
+        # for the three real bugs found and fixed getting here (ack-resend
+        # deadlock under loss, ping-pong latency, cross-message
+        # corruption). Replaced UDPTransport outright (not added
+        # alongside as "udp-rs") per explicit instruction - the old
+        # asyncio-per-packet UDPTransport implementation still exists in
+        # udp_transport.py if ever needed for comparison, just no longer
+        # reachable through this factory.
+        from vllm.transport.udp_rs_transport import RawUdpRsTransport
 
-        return UDPTransport()
+        return RawUdpRsTransport()
     if name == "quic":
+        # Rust-native end to end: quinn-proto's protocol state machine AND
+        # the whole I/O loop around it (handshake, timers, GSO send,
+        # stream framing, drain-before-close) run on a dedicated Rust
+        # thread (vllm._rust_quic_engine's PyQuicConnectionDriver) - see
+        # quic_transport.py's module docstring and the
+        # project_quic_rs_rust_native_driver memory entry for the real
+        # deadlock bug found and fixed getting here, and the throughput
+        # numbers vs the two backends this replaced. Replaced BOTH the
+        # original aioquic-based QUICTransport and the Python-asyncio-
+        # orchestrated "quic-rs" (RustQuicTransport) outright per explicit
+        # instruction, not added alongside as a third opt-in name -
+        # "quic-shared" below went through the identical consolidation
+        # (its own old aioquic + Python-orchestrated-Rust variants merged
+        # into one Rust-native broker), not a separate capability that
+        # was left behind.
         from vllm.transport.quic_transport import QUICTransport
 
         return QUICTransport()
@@ -33,12 +61,18 @@ def get_transport(backend: str | None = None) -> Transport:
         # control channel) multiplexed over ONE real QUIC connection to
         # a given peer machine, instead of "quic"'s one-connection-per-
         # channel - see vllm/transport/quic_broker.py's module docstring.
-        # Unlike every other backend here, this one needs its
-        # `TransportConfig.extra` populated by the caller with
-        # `broker_socket_path`/`channel` (see quic_multiplexed_transport.py)
-        # - the actual QUIC connection is owned by a separate
-        # `quic_broker_daemon` process, started ahead of time by
-        # stage_server.py/launch_pp_stage.py, not by this call.
+        # The broker itself (a separate `quic_broker_daemon` process,
+        # started ahead of time by stage_server.py/launch_pp_stage.py) is
+        # now Rust-native end to end (vllm._rust_quic_engine's
+        # PyMultiplexedConnectionDriver), replacing both the old aioquic
+        # QuicBroker and the old Python-orchestrated RustQuicBroker
+        # outright - same consolidation "quic" went through. This
+        # transport class itself is 100% backend-agnostic either way (it
+        # only speaks the local Unix-socket IPC protocol, never QUIC
+        # directly - see quic_multiplexed_transport.py), so it needed no
+        # changes at all. Unlike every other backend here, this one needs
+        # its `TransportConfig.extra` populated by the caller with
+        # `broker_socket_path`/`channel`.
         from vllm.transport.quic_multiplexed_transport import QuicMultiplexedTransport
 
         return QuicMultiplexedTransport()

@@ -317,8 +317,10 @@ def _connect_remote_stages(pipelined: bool = False) -> list[_RemoteStageLink]:
             # Same shared-QUIC-connection design as the PP tensor links
             # (see pipeline_bootstrap.py's establish_pp_transports) - this
             # RPC control channel is just one more named channel on the
-            # SAME per-peer QuicBroker connection, not a separate
-            # hole-punch/handshake of its own.
+            # SAME per-peer broker connection, not a separate
+            # hole-punch/handshake of its own. `broker_socket_path` is
+            # shared unmodified between the aioquic and Rust brokers - see
+            # quic_rs_broker.py's module docstring.
             from vllm.transport.quic_broker import broker_socket_path
 
             transport.connect(

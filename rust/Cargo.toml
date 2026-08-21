@@ -10,7 +10,11 @@ members = [
     "src/mock-engine",
     "src/parser",
     "src/parser/python",
+    "src/quic_engine",
+    "src/quic_engine/python",
     "src/server",
+    "src/udp_raw_engine",
+    "src/udp_raw_engine/python",
     "src/text",
     "src/tokenizer",
     "src/tracing",
@@ -76,9 +80,12 @@ prost = "0.14.3"
 prost-types = "0.14.3"
 pyo3 = "0.28.3"
 pythonize = "0.28.0"
+quinn-proto = "0.11.17"
 rand = "0.9.2"
 rand_distr = "0.5.1"
 rayon = "1.11.0"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 reasoning-parser = "1.2.2"
 reqwest = { version = "0.12.8", default-features = false, features = ["native-tls"] }
 reqwest-0-13 = { package = "reqwest", version = "0.13.4", default-features = false, features = ["native-tls"] }
@@ -141,6 +148,8 @@ vllm-llm = { path = "src/llm" }
 vllm-managed-engine = { path = "src/managed-engine" }
 vllm-metrics = { path = "src/metrics" }
 vllm-parser = { path = "src/parser" }
+vllm-quic-engine = { path = "src/quic_engine" }
+vllm-udp-raw-engine = { path = "src/udp_raw_engine" }
 vllm-server = { path = "src/server" }
 vllm-text = { path = "src/text" }
 vllm-tokenizer = { path = "src/tokenizer" }

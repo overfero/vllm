@@ -98,6 +98,7 @@ def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> None:
     """
     if args.transport != "quic-shared":
         return
+    daemon_module = "vllm.transport.quic_broker_daemon"
 
     import subprocess
     import tempfile
@@ -119,7 +120,7 @@ def _maybe_start_quic_broker_daemons(args: argparse.Namespace) -> None:
         os.close(ready_fd)
         os.remove(ready_path)
         cmd = [
-            sys.executable, "-m", "vllm.transport.quic_broker_daemon",
+            sys.executable, "-m", daemon_module,
             "--self-id", args.self_name, "--peer-id", peer_name,
             "--signaling-url", args.signaling_url,
             "--udp-port", str(args.udp_port_base + i),

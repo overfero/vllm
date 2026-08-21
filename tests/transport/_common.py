@@ -95,10 +95,13 @@ def transport_config_pair(
                 self_id=id_b, peer_id=id_a, signaling_url=signaling_url, udp_mode="preserve", udp_port=base_port + 1
             ),
         )
-    if backend == "quic":
+    if backend in ("quic", "quic-rs"):
         # Also needs signaling (hole punch is shared with udp - see
         # quic_transport.py's module docstring) plus `listen` to pick TLS
         # role: the listening side presents a certificate (QUIC "server").
+        # "quic-rs" (quic_rs_transport.py, Rust/quinn-proto backed) uses the
+        # identical TransportConfig shape as "quic" (aioquic-backed) - same
+        # hole-punch fields, same listen/TLS-role convention.
         assert signaling_url is not None
         return (
             TransportConfig(

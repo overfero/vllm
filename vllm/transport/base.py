@@ -41,7 +41,16 @@ class TransportConfig:
 
     # QUICTransport (also reuses signaling_url/udp_mode/udp_port/stun_*/
     # connect_timeout/listen above - hole punch is shared with UDPTransport,
-    # see quic_transport.py's module docstring)
+    # see quic_transport.py's module docstring). Window sizing is entirely
+    # buffer-derived (real getsockopt-granted SO_RCVBUF/SO_SNDBUF, not a
+    # fixed config knob) - see quic_transport.py's _connect_async for the
+    # full derivation and the real-testing evidence behind each ratio.
+    # `quic_congestion_control_algorithm`/`quic_max_data`/
+    # `quic_max_stream_data` (aioquic-specific tuning knobs, "cubic vs
+    # reno" and fixed-size windows) were removed along with the aioquic
+    # backend they were exclusively for - the Rust engine's congestion
+    # controller and window sizing aren't caller-configurable the same
+    # way (see rust/src/quic_engine/src/congestion.rs).
     quic_idle_timeout: float = 45.0  # seconds with no traffic before the QUIC
     # connection itself declares the peer dead (independent of, and a real
     # improvement over, UDPTransport's total lack of dead-peer detection)

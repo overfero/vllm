@@ -117,10 +117,10 @@ def _leak_verdict(rss_samples: list[float], per_message_mb: float) -> tuple[bool
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], required=True)
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-rs"], required=True)
     args = parser.parse_args()
 
-    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic", "quic-rs") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()

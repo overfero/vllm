@@ -922,7 +922,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Worker-to-worker communication transport backend. See vllm/transport/
     # for the abstraction this selects between (vllm.transport.get_transport()).
-    "VLLM_TRANSPORT": env_with_choices("VLLM_TRANSPORT", "tcp", ["tcp", "udp", "quic", "quic-shared"]),
+    "VLLM_TRANSPORT": env_with_choices(
+        "VLLM_TRANSPORT", "tcp", ["tcp", "udp", "quic", "quic-shared"]
+    ),
     # Path to the cache for storing downloaded assets
     "VLLM_ASSETS_CACHE": lambda: os.path.expanduser(
         os.getenv(

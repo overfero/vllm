@@ -83,7 +83,7 @@ def main() -> int:
         print("error: --next-name must be omitted iff --pp-rank is the last stage", file=sys.stderr)
         return 2
 
-    if args.transport in ("udp", "quic"):
+    if args.transport in ("udp", "quic", "quic-shared"):
         if not args.signaling_url:
             print(f"error: --signaling-url is required for --transport {args.transport}", file=sys.stderr)
             return 2

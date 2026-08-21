@@ -241,18 +241,21 @@ def establish_pp_transports(
         if effective_backend == "quic-shared":
             # No hole-punch/handshake happens here at all - the real QUIC
             # connection to `peer_name` is owned by a separate
-            # `quic_broker_daemon` process (started ahead of this one by
-            # stage_server.py/launch_pp_stage.py - see those modules'
-            # `_maybe_start_quic_broker_daemon`), already multiplexing
-            # every channel to that peer. This just connects to that
-            # daemon's local Unix socket and asks for this rank's own
-            # channel - see quic_broker.py's module docstring for the
-            # full design. `connect_timeout` here bounds ONLY the local
-            # socket retry loop (see QuicMultiplexedTransport.connect()),
-            # not any network hole-punch, so it does not need to be as
-            # generous as the daemon's own - but is kept equal so a
-            # slow-to-start daemon (e.g. one still mid hole-punch) doesn't
-            # make this worker give up first.
+            # `quic_broker_daemon`/`quic_rs_broker_daemon` process (started
+            # ahead of this one by stage_server.py/launch_pp_stage.py - see
+            # those modules' `_maybe_start_quic_broker_daemons`), already
+            # multiplexing every channel to that peer. This just connects
+            # to that daemon's local Unix socket and asks for this rank's
+            # own channel - see quic_broker.py's/quic_rs_broker.py's module
+            # docstrings for the full design (identical socket-path
+            # convention for both, since `broker_socket_path` is shared
+            # unmodified between them - see quic_rs_broker.py's docstring).
+            # `connect_timeout` here bounds ONLY the local socket retry
+            # loop (see QuicMultiplexedTransport.connect()), not any
+            # network hole-punch, so it does not need to be as generous as
+            # the daemon's own - but is kept equal so a slow-to-start
+            # daemon (e.g. one still mid hole-punch) doesn't make this
+            # worker give up first.
             from vllm.transport.quic_broker import broker_socket_path
 
             config = TransportConfig(

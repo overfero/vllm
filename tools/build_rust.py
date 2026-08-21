@@ -33,6 +33,22 @@ def rust_extensions(*, optional: bool = False) -> list[RustExtension]:
             optional=optional,
             py_limited_api=True,
         ),
+        RustExtension(
+            target="vllm._rust_quic_engine",
+            path="rust/src/quic_engine/python/Cargo.toml",
+            features=["pyo3/abi3-py38"],
+            binding=Binding.PyO3,
+            optional=optional,
+            py_limited_api=True,
+        ),
+        RustExtension(
+            target="vllm._rust_udp_raw_engine",
+            path="rust/src/udp_raw_engine/python/Cargo.toml",
+            features=["pyo3/abi3-py38"],
+            binding=Binding.PyO3,
+            optional=optional,
+            py_limited_api=True,
+        ),
     ]
 
 

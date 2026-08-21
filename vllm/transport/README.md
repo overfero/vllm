@@ -829,3 +829,331 @@ short of fixing them itself - in `README_GPTOSS_120B_UDP.md`'s "Remaining
 blockers" section. Neither is a transport or distributed-bootstrap
 problem; both are pre-existing environment/build gaps this specific
 sandbox has, unrelated to anything this project changed.
+
+# Phase 6: a Rust-native `"udp"` backend, replacing the asyncio one
+
+Phases 1-5 built `UDPTransport` on the existing `peer.py` hole-punch
+transport, with message framing and reliability (chunk/status-query/
+resend) implemented in Python on top of asyncio's `DatagramProtocol` -
+one `sendto()`/`recvfrom()` syscall per datagram, dispatched through one
+Python callback per datagram. Profiling that architecture (see
+`udp_transport.py`'s and `quic_rs_transport.py`'s own module docstrings)
+repeatedly found this per-packet Python/asyncio dispatch overhead as the
+dominant cost, not the kernel, not the protocol. This phase answers the
+question that raised: what's the real ceiling if that architecture is
+replaced entirely, and is it worth doing for real traffic?
+
+## Benchmark investigation (loopback, why sendmmsg/recvmmsg batching was chosen)
+
+Built `rust/src/udp_raw_engine/` (Rust, `libc::sendmmsg`/`recvmmsg` -
+Linux batched-datagram syscalls, many datagrams per syscall each
+direction) as a from-scratch experiment, deliberately *unreliable* at
+first, to isolate the real throughput ceiling before paying for
+reliability. Rigorous synchronized-timing methodology throughout
+(`multiprocessing.Barrier` for both sides' `t0` - an earlier, since-
+corrected round of ad-hoc benchmarks understated every number here by
+~3.7-4x due to a blind-`sleep()`-based timing bug, documented in full in
+the `project_raw_udp_rs_bench` memory entry for anyone re-deriving these
+numbers later). 16MB payload, loopback, byte-perfect every run:
+
+| Path | Mbps | Notes |
+|---|---|---|
+| `udp_transport.py` (asyncio, old) | 263-299 | one syscall/callback per datagram |
+| `quic_rs_transport.py` (Rust `quinn-proto`, but Python asyncio I/O loop) | 234-274 | protocol logic in Rust; socket I/O still per-packet Python - see below |
+| raw UDP-rs, GSO/GRO batching | 1133-1230 | `UDP_SEGMENT`/`UDP_GRO`, ~65KB aggregate cap per syscall forces more rounds |
+| raw UDP-rs, **sendmmsg/recvmmsg batching** | **1672-1813** | chosen path - fewer, larger syscalls per round than GSO's cap allows |
+| plain TCP (same rigorous script) | 4204-4634 | reference ceiling |
+| raw UDP-rs, multi-socket N=8 (unreliable, loopback only) | 3603-4206 | **not integrated into the reliable engine - see "Explicitly not done" below** |
+
+Two structural findings, not implementation bugs, explain most of the
+remaining ~2.3-2.8x gap to TCP: (1) TCP sockets on Linux auto-tune send/
+receive buffers up to several MB (`net.ipv4.tcp_rmem`/`tcp_wmem`,
+`tcp_moderate_rcvbuf`); UDP sockets are hard-capped at
+`net.core.rmem_max`/`wmem_max` (208 KiB on this machine, confirmed not
+raisable from inside this container - no `CAP_NET_ADMIN`), with no
+per-protocol override; (2) real QUIC packet/protocol overhead
+(AEAD encrypt/decrypt, ACK-frame processing, congestion control) is
+irreducible and not present in this raw engine at all - see the
+`project_udp_vs_tcp_kernel_buffer_policy` and
+`project_quic_rs_vs_raw_udp_gap` memory entries for the full evidence
+trail on each. Kernel-bypass options (`AF_XDP`, `DPDK`) were checked
+directly, not just assumed - both are blocked by this container's
+capability set (`ip link ... xdp` and the raw `bpf()` syscall both fail
+with real permission errors, `CAP_NET_ADMIN`/`CAP_BPF`/`CAP_SYS_ADMIN`
+all absent), so they are not an available lever here.
+
+## What changed (this phase)
+
+| File | What it is |
+|---|---|
+| `rust/src/udp_raw_engine/src/lib.rs` | `RawUdpEngine` - `send_batch`/`recv_batch` (raw `sendmmsg`/`recvmmsg` primitives), `send_reliable`/`recv_reliable` (single-shot, caller-knows-size - the benchmark pair), `send_message`/`recv_message` (dynamic-size discovery + `msg_id` disambiguation - the pair this backend actually uses), `send_reliable_gso`/`recv_reliable_gro` (GSO/GRO alternative - **still unreliable**, measured slower, not used by this backend) |
+| `rust/src/udp_raw_engine/python/src/lib.rs` | `PyRawUdpEngine` PyO3 binding - `from_fd` (dup()s the caller's socket fd), thin wrappers releasing the GIL (`py.detach`) for every blocking call |
+| `vllm/transport/udp_rs_raw_bench.py` | `RawUdpBench` - thin benchmark-only wrapper (kept for reference/regression benchmarking, NOT used by `factory.py`) |
+| `vllm/transport/udp_rs_transport.py` | **New** - `RawUdpRsTransport`, the real `Transport` implementation this phase adds. Reuses `peer.py`'s hole-punch/STUN unmodified for connection setup; hands the connected socket to `PyRawUdpEngine.from_fd()` for the data path once established; plain-thread keepalive (no asyncio left after handoff) |
+| `vllm/transport/factory.py` | `"udp"` now resolves to `RawUdpRsTransport`, replacing `UDPTransport` outright (not added alongside as a separate opt-in name) - `udp_transport.py` itself is untouched and still importable directly if ever needed for comparison |
+
+## Three real bugs found via targeted testing, not code review
+
+Each was found by a DIFFERENT testing technique aimed at a different
+failure class - worth remembering as a checklist for future changes to
+this engine, not just "add more benchmarks":
+
+1. **Ack-resend deadlock under real packet loss** - found via a custom
+   lossy UDP relay proxy (loopback essentially never drops on its own,
+   so this needed to be induced). The receiver only re-sent its
+   cumulative ack when its VALUE changed since last sent; if that one
+   ack packet was itself lost, the receiver believed it had already
+   informed the sender and never repeated it, while the sender's own
+   resends of already-fully-received data produced no new receiver-side
+   state change to prompt a fresh attempt. Fixed: acks now re-send
+   unconditionally on a 2ms timer while idle, not gated on "did the
+   value change."
+2. **~40ms round-trip latency bug** (should be sub-millisecond on
+   loopback) - found via a ping-pong latency test. A sender's own
+   ack-polling loop could read the peer's already-in-flight reply DATA
+   packet in the same `recvmmsg` batch as the ack it was waiting for,
+   and silently discarded it (wrong type for that loop), forcing a real
+   ~20ms retransmit cycle to recover a packet that had already arrived.
+   Fixed: `pending_acks`/`pending_data` stashes on the engine hold onto a
+   "wrong type" packet for the OTHER poller instead of dropping it.
+   Result: 40ms → ~0.32-0.35ms p50 (500 rounds, 64B messages).
+3. **Cross-message data corruption in back-to-back streaming** - found
+   via a 300-message randomized-size streaming test (no ping-pong
+   turn-taking, sender blasts through messages as fast as each
+   `send_message` returns). Message N+1's chunks reused the SAME
+   sequence numbers message N used; if the receiver's `recv_message`
+   call for message N hadn't returned to Python yet when N+1's early
+   chunks arrived (a real, observed race - the kernel buffers them
+   regardless), a coincidental sequence-number match spliced message
+   N+1's bytes into message N's buffer. Confirmed directly: message
+   11/300 came back at a length between two real message sizes. Fixed:
+   every chunk now carries a `msg_id`; `recv_message` keeps persistent
+   per-`msg_id` receive state across calls (`inbound`/`completed_order`
+   on the engine) instead of call-scoped locals.
+
+Full technical detail on all three (exact mechanism, wire-format
+changes, code locations) is in the `project_raw_udp_rs_production_readiness`
+memory entry.
+
+## Test results (this phase, real hole-punch, both peers on one machine, `--transport udp`)
+
+Existing `tests/transport/test*.py` suite, unmodified, run against the
+new backend for real (not just the new engine in isolation):
+
+| Test | Result |
+|---|---|
+| `test1_hello_world.py` | PASS |
+| `test2_payload_sizes.py` (1KB-16MB) | PASS, byte-perfect every size |
+| `test3_ping_pong.py` (1000 packets) | PASS, avg RTT 0.518ms, P99 0.846ms, **0.00% loss** |
+| `test5_concurrent.py` (4 workers) | PASS, no cross-talk |
+| `test6_tensor_small.py` (24 dtype/size cases) | PASS |
+| `test7_tensor_large.py` (1-64MB tensors) | PASS, 695-1037 Mbps |
+| `test8_tensor_streaming.py` (1000 tensors back-to-back) | PASS, **0 lost, 0 corrupted** - the exact scenario bug #3 above was found in |
+| `test9_tensor_bidirectional.py` | PASS |
+| `test24_dead_peer_timeout.py` | Not applicable to this backend - this test specifically exercises QUIC's protocol-level idle timeout (`--transport quic`'s own documented purpose); UDP-family transports (old and new alike) never had real dead-peer detection independent of the caller's own `recv()` timeout, so this isn't a regression this phase introduced |
+
+## Explicitly not done this phase (honest gaps)
+
+- **Multi-socket parallelism (N=8, ~3.6-4.2 Gbps unreliable on
+  loopback) was investigated but deliberately NOT integrated** into the
+  reliable engine. Reconsidered mid-session: that gain is loopback-
+  specific (it works around loopback's own local kernel UDP buffer
+  ceiling), and on a real cross-machine link the bottleneck is normally
+  the physical connection itself, not the local socket buffer - opening
+  N parallel flows might not reproduce the gain there, some network
+  paths penalize many parallel flows from one host, and it would add N×
+  the reliability-state-machine complexity. Left for a future revisit
+  IF a real 2-machine benchmark shows it's still needed.
+- `send_reliable_gso`/`recv_reliable_gro` did not receive any of the
+  three fixes above - still unreliable, still benchmark-only (already
+  measured slower than the sendmmsg path, so not a loss).
+- NAT-rebind resilience during the DATA phase (the old `UDPTransport`'s
+  `_recent_peer_addrs`, sending to every recently-seen address to
+  survive one side's NAT round-robining across external IPs) was not
+  carried over - `connect()` locks the new engine to a single peer
+  address for its whole data-phase lifetime. Hole-punch itself still
+  detects/logs a rebind during connection setup.
+- No dead-peer/idle-timeout detection independent of the caller's own
+  `recv(timeout=...)` - same gap the old `UDPTransport` had; only the
+  QUIC backends solve this structurally via the protocol's own idle
+  timeout.
+
+# Phase 7: QUIC gets the same treatment - one Rust-native `"quic"` backend
+
+Phase 6 moved raw UDP's whole data path into Rust. This project had TWO
+QUIC backends at the time: the original aioquic-based `QUICTransport`
+("quic") and a partial Rust port ("quic-rs") that moved only the protocol
+*state machine* (`quinn-proto` via `Engine`) to Rust while socket I/O,
+timer scheduling, and event draining still ran through Python asyncio -
+see [[project_quic_rs_vs_raw_udp_gap]] (memory) for why that architecture
+left "quic-rs" slower than raw-udp-rs despite the protocol logic already
+being native. This phase finishes the job: the ENTIRE connection
+lifetime - handshake, timers, GSO send, stream framing, drain-before-
+close - now runs on a dedicated Rust thread, and the two old backends
+were deleted outright and consolidated into one `"quic"` name (not kept
+alongside as a third opt-in variant) per explicit instruction.
+
+## What changed
+
+| File | What it is |
+|---|---|
+| `rust/src/quic_engine/src/driver.rs` | **New.** `ConnectionDriver` - owns a real `UdpSocket` + the existing sans-io `Engine`, drives the whole connection on a background thread. Cross-thread comms via `std::sync::mpsc` channels (`send()`/`recv()`/`connect()` each block on a per-call or per-connection channel, GIL released by the PyO3 wrapper) |
+| `rust/src/quic_engine/python/src/lib.rs` | Added `PyQuicConnectionDriver` (`connect_client`/`connect_server`/`send`/`recv`/`close`) alongside the existing lower-level `PyQuicEngine` (kept, unused by any transport now, same "keep the lower-level primitive around" precedent `udp_raw_engine` already set) |
+| `vllm/transport/quic_transport.py` | **Rewritten in place** - old aioquic content replaced with `QUICTransport` built on `PyQuicConnectionDriver`. Hole-punch reused unmodified from `peer.py`, same handoff pattern `udp_rs_transport.py` established (asyncio drives ONLY hole-punch, then torn down entirely) |
+| `vllm/transport/quic_rs_transport.py` | **Deleted** - the old asyncio-orchestrated Rust-backed transport, fully superseded |
+| `vllm/transport/factory.py` | `"quic-rs"` branch removed entirely; `"quic"` now resolves to the rewritten `quic_transport.py`. `"quic-shared"`/`"quic-rs-shared"` (multiplexed channels, `quic_broker.py`/`quic_rs_broker.py`) explicitly confirmed out of scope and left untouched - different capability, not another way to do the same thing |
+| `vllm/transport/base.py` | Removed 3 now-dead `TransportConfig` fields (`quic_congestion_control_algorithm`/`quic_max_data`/`quic_max_stream_data`) - aioquic-only tuning knobs nothing reads anymore now that backend is gone |
+
+One real architectural simplification fell out of the port, not just a
+straight translation: the old design's 1-byte `_QUIC_TAG` wire prefix
+existed only because asyncio's single dispatcher shared one socket
+between hole-punch control traffic and QUIC application data. Since
+`ConnectionDriver` only ever takes ownership of the socket AFTER
+hole-punch fully completes (same handoff pattern as the raw UDP
+backend), nothing else ever reads the socket again - the tag byte is
+unneeded in the new design, not merely carried over.
+
+## A real bug found via testing methodology, not code review
+
+A single 16MB `send()` hung forever; an isolated 300-message streaming
+test (up to 500KB each) passed on the very first try, never exercising
+the buggy path. Root cause: the edge-triggered "wait for a
+`StreamEvent::Writable` event before retrying a blocked stream write"
+gate was implemented as `pending.offset > 0` (true for ANY message with
+some data already written) instead of "was the immediately-preceding
+write attempt genuinely blocked." Since `Writable` only fires on a
+transition INTO blocked and back OUT (a real, documented quinn-proto
+contract - `WriteError::Blocked` folds into `Ok(0)`), a message spanning
+multiple driver-loop iterations without ever actually exhausting the
+flow-control window would wait forever for an edge that could never
+occur. This is the EXACT deadlock class `quic_rs_transport.py`'s own
+`send_message` docstring already documented fixing once for the Python
+version (large single messages used to stall completely, per that file's
+"KNOWN, UNRESOLVED LIMITATION... RESOLVED" history) - reintroduced fresh
+in this new Rust port via a subtly wrong gate condition, caught only
+because a large-message test was run separately from the
+already-passing small-message streaming test. Fixed with a dedicated
+`blocked_on_writable` flag set only on a genuine `Ok(0)` result.
+
+## Test results (real hole-punch, both peers on one machine, `--transport quic`)
+
+Full existing suite, unmodified, all PASS:
+
+| Test | Result |
+|---|---|
+| `test1_hello_world.py` | PASS |
+| `test2_payload_sizes.py` (1KB-16MB) | PASS, byte-perfect every size |
+| `test3_ping_pong.py` (1000 packets) | PASS, avg RTT 0.234ms, **0.00% loss** |
+| `test5_concurrent.py` (4 workers) | PASS, no cross-talk |
+| `test6_tensor_small.py` (24 dtype/size cases) | PASS |
+| `test7_tensor_large.py` (1-64MB) | PASS, 346-508 Mbps |
+| `test8_tensor_streaming.py` (1000 tensors) | PASS, 0 lost/corrupted, 337 Mbps |
+| `test9_tensor_bidirectional.py` | PASS |
+| `test22_tensor_500mb_memory.py` | PASS - 500MB single transfer (8.67s) + 50x10MB repeat, memory flat (the exact scenario the old aioquic docstring documented as historically fragile) |
+| `test23_fault_injection_lossy.py` (5% drop/3% dup/15% reorder) | PASS, byte-perfect despite injected loss |
+| `test24_dead_peer_timeout.py` (real SIGKILL) | **PASS** - detected in exactly 5.00s matching the configured `idle_timeout`, something the `udp` backend structurally cannot do (real protocol-level connection state, not just an application-level `recv()` timeout) |
+
+Isolated (no hole-punch, direct `PyQuicConnectionDriver` use) rigorous
+`multiprocessing.Barrier`-synchronized throughput: 694-741 Mbps for a
+single 16MB message - compared to the old Python-orchestrated "quic-rs"
+(234-274 Mbps, same methodology): **~2.7-3x faster**.
+
+## Explicitly not done this phase (honest gaps)
+
+- `simulate_rebind`/`test21_connection_migration.py` not run against the
+  new driver - no equivalent connection-migration test hook built yet.
+- Real QUIC-level keepalive PING still not exposed by `ConnectionDriver`
+  (same gap the old Python-orchestrated version had) - keepalive stays
+  NAT-pinhole-only via `peer.py`'s own ping tag.
+- `quic_rs_broker.py` (kept, backs `"quic-rs-shared"`) still has several
+  comments referencing the now-deleted `quic_rs_transport.py` by name -
+  harmless prose staleness, deliberately left alone since that file was
+  explicitly confirmed out of scope.
+- ~24 `tests/transport/test*.py` files' `argparse` `--transport` choices
+  lists still list `"quic-rs"` - passing it now raises a `ValueError`
+  from `factory.py` rather than being rejected at CLI-parse time.
+  Cosmetic, not fixed this phase.
+
+# Phase 8: `"quic-shared"` gets the same treatment - one Rust-native broker
+
+Same consolidation as phase 7, applied to the multiplexed-channel broker
+(several logical channels - per-TP-rank PP links plus the RPC control
+channel - sharing ONE real QUIC connection instead of each hole-punching
+its own). `MultiplexedConnectionDriver` (new,
+`rust/src/quic_engine/src/multiplexed_driver.rs`) is the multi-channel
+analogue of phase 7's `ConnectionDriver`, sharing its GSO/cmsg helpers.
+`"quic-shared"`/`"quic-rs-shared"` consolidated into one `"quic-shared"`
+name per explicit confirmation - old aioquic `quic_broker.py` and the old
+Python-orchestrated `quic_rs_broker.py` (+ both daemon launcher scripts)
+deleted outright. `quic_broker_common.py` (new) holds the genuinely
+backend-agnostic local-Unix-socket IPC plumbing, extracted so it's no
+longer bundled inside the aioquic-specific file. `quic_multiplexed_transport.py`
+(the actual client-facing `Transport`) needed zero changes - already
+100% backend-agnostic.
+
+Also fixed real staleness found while consolidating: `scripts/stage_server.py`/
+`scripts/launch_pp_stage.py`'s daemon-launcher logic, several
+`--transport` `choices` lists, and two membership checks still treated
+`"quic-rs"`/`"quic-rs-shared"` as live options (some missed during phase
+7 itself - a reminder to grep the whole repo for a retired name, not
+just the transport package).
+
+## A severe production bug: `close()` could hang a real daemon forever
+
+Found by testing the REAL `quic_broker_daemon.py` subprocess end-to-end
+(launch, connect, SIGTERM, expect clean exit) - a bare in-process
+`connect()`-then-`close()` test passed fine, but the real daemon (which
+has a background dispatch loop continuously blocked in a `recv`-style
+call) hung indefinitely. Root cause, confirmed by testing `close()`
+directly while a separate thread had a blocking `recv` call genuinely in
+flight: **a PyO3 dynamic borrow-checking conflict, not a Rust logic
+bug**. `close()`'s PyO3 wrapper was `&mut self` (needs an EXCLUSIVE
+borrow); `recv()`/`recv_any()` (`&self`) held a SHARED borrow for its
+entire blocking duration - `py.detach()` releases the Python GIL during
+that call but NOT PyO3's own borrow guard. Rust can never grant an
+exclusive borrow while a shared one is outstanding, so `close()` raised
+`RuntimeError: Already borrowed` before its body ever ran - `shutdown`
+was never set, hanging the thread (and the whole process) forever. The
+exception was silently swallowed by a `contextlib.suppress(Exception)`
+already present in the Python wrapper, making this fail completely
+silently in production - no error, no log, just a daemon that never
+exits. **Affected BOTH drivers** (`"quic"` and `"quic-shared"`), not just
+the new multiplexed one - see [[project_quic_shared_rust_native_broker]]
+(memory) for the full account, including a RETROACTIVE correction added
+to phase 7's own memory entry.
+
+Fixed by changing `close()` to `&self` at both the PyO3 wrapper level and
+the underlying Rust struct level, using `std::sync::Mutex<Option<JoinHandle<()>>>`
+(interior mutability) instead of a plain `Option<...>` field for the one
+genuinely-mutating operation. Confirmed fixed: a direct repro (thread
+blocked in `recv_any()`, `close()` called concurrently) now completes in
+~10ms; the real daemon subprocess now shuts down in ~0.8s instead of
+hanging forever.
+
+**A second, related bug** found in the same investigation, before even
+finding the borrow conflict: `close()` waited for a `drained` flag
+BEFORE setting `shutdown` - but the driver thread only sets `drained`
+AFTER observing `shutdown`. A pure wait-before-signal deadlock that made
+EVERY `close()` call take exactly the full `drain_timeout`, unconditionally,
+even with nothing to drain (confirmed: a bare connect-then-close took
+exactly 3.01s, matching `drain_timeout` to the millisecond). The grace
+period the thread actually used internally was also hardcoded to 200ms,
+ignoring whatever `drain_timeout` the caller passed. Fixed by setting
+`shutdown` first and threading the real timeout through a shared atomic.
+Confirmed fixed: isolated `close()` with nothing to drain now takes
+0.1-0.4ms, not 3000ms - and `test5_concurrent.py`'s 4-worker wall time
+dropped from 9.20s to 6.17s as a direct, measurable consequence.
+
+## Test results
+
+`test26_quic_broker_multiplexing.py` (3 channels, 20 messages each
+direction, real local-socket IPC hop): PASS - order preserved, zero
+cross-channel leakage, single shared connection confirmed (the test
+itself needed a small fix too - it inspected `broker._quic`, an
+aioquic-only attribute that no longer exists; updated to check
+`broker._driver`'s identity instead, preserving the test's actual
+intent). Real daemon end-to-end (subprocess launch, `get_transport
+("quic-shared")` + `TransportConfig.extra`, real message exchange, clean
+SIGTERM shutdown): PASS. Existing `"quic"` single-channel suite re-run
+after the shared `close()` fix: still PASS, same numbers as phase 7
+within noise.

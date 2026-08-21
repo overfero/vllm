@@ -3,7 +3,21 @@ peers, each pair getting its own synchronized punch time.
 
 Exchanges endpoint info and a per-pair synchronized punch timestamp over
 HTTP. Never touches UDP traffic and never relays anything.
+
+Also exposes a small generic key-value store (`/kv/*`, added for
+`quic_dist.store.QuicRendezvousStore` - see that module's docstring) -
+purely additive, does not touch or depend on the hole-punch endpoints
+above. Backs `torch.distributed`'s own store-based rendezvous/barrier
+(`torch.distributed.distributed_c10d._store_based_barrier`, which needs
+real `set`/`get`/`add`/`wait` semantics on arbitrary keys - not something
+`/register`/`/peer/{id}` provide, those are hole-punch-specific) without
+requiring direct reachability to any one rank, the same NAT-avoidance
+this whole coordinator already exists for. `wait()` is implemented
+client-side via polling `GET /kv/get?key=` (matching `wait_for_peer`'s
+existing pattern above), not server-side blocking - consistent with this
+file's own conventions, no new concurrency primitives needed here.
 """
+import threading
 import time
 from typing import Dict, FrozenSet
 
@@ -16,6 +30,9 @@ SYNC_BUFFER_SECONDS = 5.0  # lead time given to both peers before they must star
 
 _peers: Dict[str, dict] = {}
 _start_at: Dict[FrozenSet[str], float] = {}  # keyed by {peer_id, self_id} - independent per pair
+
+_kv: Dict[str, str] = {}
+_kv_lock = threading.Lock()  # uvicorn can serve requests concurrently (threadpool) - add() must be atomic
 
 
 class Registration(BaseModel):
@@ -61,6 +78,76 @@ def get_peer(peer_id: str, self_id: str = Query(..., description="Caller's own p
     if pair not in _start_at:
         _start_at[pair] = time.time() + SYNC_BUFFER_SECONDS
     return {**peer, "start_at": _start_at[pair]}
+
+
+# --------------------------------------------------------------------------
+# Generic key-value store - see module docstring for why this exists
+# --------------------------------------------------------------------------
+class KVSet(BaseModel):
+    key: str
+    value: str  # base64-encoded bytes - see QuicRendezvousStore, arbitrary
+    # bytes (not just UTF-8 text) must round-trip through this exactly
+
+
+class KVAdd(BaseModel):
+    key: str
+    amount: int
+
+
+class KVCompareSet(BaseModel):
+    key: str
+    expected: str  # base64 - "" (not present) is a valid expected value
+    desired: str  # base64
+
+
+@app.post("/kv/set")
+def kv_set(body: KVSet) -> dict:
+    with _kv_lock:
+        _kv[body.key] = body.value
+    return {"status": "ok"}
+
+
+@app.get("/kv/get")
+def kv_get(key: str = Query(...)) -> dict:
+    # Query param, not a path segment: torch.distributed.PrefixStore always
+    # produces keys containing "/" (e.g. "mygroup/k1", "0//cpu//...") - a
+    # path segment like /kv/get/{key} silently 404s on those (FastAPI
+    # routing splits on "/"), which surfaced as every real barrier() call
+    # hanging until timeout. A query string handles arbitrary key content.
+    with _kv_lock:
+        if key not in _kv:
+            raise HTTPException(status_code=404, detail="key not set yet")
+        return {"key": key, "value": _kv[key]}
+
+
+@app.post("/kv/add")
+def kv_add(body: KVAdd) -> dict:
+    # torch's Store.add() stores/returns a plain integer counter, not
+    # base64 bytes - kept as a separate code path from kv_set/kv_get
+    # (which are always base64) rather than overloading the same key
+    # namespace with two different value encodings.
+    with _kv_lock:
+        current = int(_kv.get(f"__counter__{body.key}", "0"))
+        current += body.amount
+        _kv[f"__counter__{body.key}"] = str(current)
+        return {"key": body.key, "value": current}
+
+
+@app.post("/kv/compare_set")
+def kv_compare_set(body: KVCompareSet) -> dict:
+    with _kv_lock:
+        current = _kv.get(body.key, "")
+        if current == body.expected:
+            _kv[body.key] = body.desired
+            return {"key": body.key, "value": body.desired}
+        return {"key": body.key, "value": current}
+
+
+@app.delete("/kv")
+def kv_delete(key: str = Query(...)) -> dict:
+    with _kv_lock:
+        _kv.pop(key, None)
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

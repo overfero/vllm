@@ -77,15 +77,15 @@ def _receiver(result_queue, backend: str, config: TransportConfig) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], default="quic")
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-rs"], default="quic")
     args = parser.parse_args()
-    if args.transport != "quic":
+    if args.transport not in ("quic", "quic-rs"):
         print(f"NOTE: connection migration is QUIC's headline feature - running with "
-              f"--transport {args.transport} anyway, but only 'quic' actually migrates "
-              f"the socket mid-connection via simulate_rebind(); other backends will "
-              f"simply fail this test (that's expected, not a bug in them).")
+              f"--transport {args.transport} anyway, but only 'quic'/'quic-rs' actually "
+              f"migrate the socket mid-connection via simulate_rebind(); other backends "
+              f"will simply fail this test (that's expected, not a bug in them).")
 
-    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic", "quic-rs") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()
@@ -94,6 +94,19 @@ def main() -> int:
     try:
         base_port = free_port()
         cfg_sender, cfg_receiver = transport_config_pair(args.transport, "A", "B", signaling_url, base_port)
+        if args.transport == "quic-rs":
+            # quinn-proto only lets a SERVER-role connection (listen=True)
+            # accept a peer migrating to a new address - checked directly
+            # against its source (`ConnectionSide::remote_may_migrate`):
+            # `Client => false` unconditionally, `Server => server_config.
+            # migration` (true by default). aioquic enforces no such
+            # restriction, which is why the same sender=listen=True/
+            # receiver=listen=False pairing above works for `--transport
+            # quic`. For quic-rs the roles must be swapped so the side that
+            # OBSERVES the migration (the receiver here) is the server -
+            # this also happens to match real-world QUIC semantics more
+            # closely (servers accept client roaming, not the reverse).
+            cfg_sender, cfg_receiver = cfg_receiver, cfg_sender
 
         result_queue = MP_CTX.Queue()
         p_recv = MP_CTX.Process(target=_receiver, args=(result_queue, args.transport, cfg_receiver))

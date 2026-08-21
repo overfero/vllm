@@ -80,10 +80,10 @@ def _survivor(result_queue, backend: str, config: TransportConfig) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["tcp", "udp", "quic"], default="quic")
+    parser.add_argument("--transport", choices=["tcp", "udp", "quic", "quic-rs"], default="quic")
     args = parser.parse_args()
 
-    signaling = SignalingServer() if args.transport in ("udp", "quic") else None
+    signaling = SignalingServer() if args.transport in ("udp", "quic", "quic-rs") else None
     signaling_url = None
     if signaling is not None:
         signaling.start()
@@ -92,7 +92,7 @@ def main() -> int:
     try:
         base_port = free_port()
         cfg_victim, cfg_survivor = transport_config_pair(args.transport, "A", "B", signaling_url, base_port)
-        if args.transport == "quic":
+        if args.transport in ("quic", "quic-rs"):
             cfg_victim.quic_idle_timeout = IDLE_TIMEOUT_S
             cfg_survivor.quic_idle_timeout = IDLE_TIMEOUT_S
 
