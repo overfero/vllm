@@ -89,6 +89,7 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
@@ -96,6 +97,7 @@ from .utils import (
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
+    no_init_weights,
 )
 
 logger = init_logger(__name__)
@@ -472,13 +474,43 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.visual_dim = config.vision_config.out_hidden_size
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
+        # In this project's transport-backed multi-machine pipeline-parallel
+        # deployments (see cluster/*.sh, scripts/stage_server.py,
+        # scripts/launch_pp_stage.py), whether the API-serving "driver"
+        # stage accepts image/video input is a request-validation decision
+        # (--limit-mm-per-prompt / language_model_only, checked by
+        # _mark_tower_model below) that is independent of whether THIS
+        # process needs the vision tower loaded: only the first PP rank
+        # ever calls embed_input_ids with real pixel_values (multimodal
+        # merge happens before the decoder layers run) - every later rank
+        # only ever receives already-forwarded hidden states over the PP
+        # transport, never raw pixels. A driver placed at a non-first rank
+        # (a real, supported topology here - see launch_pp_stage.py's own
+        # module docstring usage example with --pp-rank 0 elsewhere)
+        # otherwise loads the full, unquantized vision tower into VRAM on
+        # a stage that can never actually run it - real bug hit running
+        # this for real: this is exactly what forced the driver to also be
+        # the vision stage in earlier attempts, wasting several GiB VRAM.
+        # Skip construction here based on live PP rank, on top of (not
+        # instead of) the normal _mark_tower_model modality-limit check.
+        _pp_group_for_vision = get_pp_group()
+        _skip_vision_here = (
+            _pp_group_for_vision.world_size > 1
+            and not _pp_group_for_vision.is_first_rank
+        )
+        with (
+            no_init_weights(self, lambda mod: StageMissingLayer("vision_tower", mod))
+            if _skip_vision_here
+            else self._mark_tower_model(vllm_config, {"image", "video"})
+        ):
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
+        if _skip_vision_here:
+            self._tower_model_names = {"visual"}
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
@@ -691,13 +723,43 @@ class Qwen3_5MoeForConditionalGeneration(
         self.visual_dim = config.vision_config.out_hidden_size
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
+        # In this project's transport-backed multi-machine pipeline-parallel
+        # deployments (see cluster/*.sh, scripts/stage_server.py,
+        # scripts/launch_pp_stage.py), whether the API-serving "driver"
+        # stage accepts image/video input is a request-validation decision
+        # (--limit-mm-per-prompt / language_model_only, checked by
+        # _mark_tower_model below) that is independent of whether THIS
+        # process needs the vision tower loaded: only the first PP rank
+        # ever calls embed_input_ids with real pixel_values (multimodal
+        # merge happens before the decoder layers run) - every later rank
+        # only ever receives already-forwarded hidden states over the PP
+        # transport, never raw pixels. A driver placed at a non-first rank
+        # (a real, supported topology here - see launch_pp_stage.py's own
+        # module docstring usage example with --pp-rank 0 elsewhere)
+        # otherwise loads the full, unquantized vision tower into VRAM on
+        # a stage that can never actually run it - real bug hit running
+        # this for real: this is exactly what forced the driver to also be
+        # the vision stage in earlier attempts, wasting several GiB VRAM.
+        # Skip construction here based on live PP rank, on top of (not
+        # instead of) the normal _mark_tower_model modality-limit check.
+        _pp_group_for_vision = get_pp_group()
+        _skip_vision_here = (
+            _pp_group_for_vision.world_size > 1
+            and not _pp_group_for_vision.is_first_rank
+        )
+        with (
+            no_init_weights(self, lambda mod: StageMissingLayer("vision_tower", mod))
+            if _skip_vision_here
+            else self._mark_tower_model(vllm_config, {"image", "video"})
+        ):
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
+        if _skip_vision_here:
+            self._tower_model_names = {"visual"}
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(

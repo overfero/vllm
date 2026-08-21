@@ -7,9 +7,16 @@ differs from GPT-OSS's:
   - globals are "lm_head.weight", "model.language_model.embed_tokens.weight",
     "model.language_model.norm.weight"
   - the checkpoint also contains "model.visual.*" (vision tower, ~27 blocks)
-    - ALWAYS excluded here since we serve text-only (--language-model-only).
-    This is safe: vLLM's language_model_only marks the vision tower as a
-    StageMissingLayer and does not require its weights
+    - excluded by default (text-only serving, --language-model-only), kept
+    with --include-vision for a stage that will actually serve images/video.
+    Only the FIRST PP stage should ever pass --include-vision (it's the one
+    that embeds raw input_ids + pixel_values; later stages only see
+    forwarded hidden states) - launch that stage WITHOUT
+    --language-model-only and every other stage WITH it, or every stage
+    will construct+load the full (unquantized) vision tower into VRAM for
+    no functional benefit. This is safe/cheap when done right: vLLM's
+    language_model_only marks the vision tower as a StageMissingLayer and
+    does not require its weights on stages that pass it
     (vllm/model_executor/models/interfaces.py's _mark_tower_model +
     vllm/config/multimodal.py's get_limit_per_prompt returning 0).
   - "mtp.*" (1 extra hidden layer for multi-token prediction / speculative
@@ -71,6 +78,19 @@ def main() -> None:
     ap.add_argument("--include-mtp", action="store_true", default=False,
                      help="keep mtp.* tensors for --speculative-config method=mtp "
                           "(only meaningful on the last PP stage)")
+    ap.add_argument("--include-vision", action="store_true", default=False,
+                     help="keep model.visual.* (vision tower) tensors - only meaningful "
+                          "on the FIRST PP stage (the one that embeds raw input_ids + "
+                          "pixel_values; later stages only ever see forwarded hidden "
+                          "states, never raw pixels). Pair with launching that stage "
+                          "WITHOUT --language-model-only, and every other stage WITH it "
+                          "(language_model_only=True makes get_limit_per_prompt() return "
+                          "0 for every modality, which _mark_tower_model uses to skip "
+                          "constructing/loading self.visual entirely on that process - "
+                          "see vllm/config/multimodal.py and "
+                          "vllm/model_executor/models/interfaces.py). Without this "
+                          "asymmetry, every stage would load the full (unquantized) "
+                          "vision tower into VRAM for no functional benefit.")
     ap.add_argument("--shards-per-batch", type=int, default=4,
                      help="source shards to hold in RAM at once before flushing to a "
                           "part file - lower this on low-RAM machines")
@@ -91,14 +111,17 @@ def main() -> None:
         keep_keys += [k for k in weight_map if k in GLOBAL_KEYS]
     if args.include_mtp:
         keep_keys += [k for k in weight_map if k.startswith("mtp.")]
+    if args.include_vision:
+        keep_keys += [k for k in weight_map if k.startswith("model.visual.")]
 
     n_visual = sum(1 for k in weight_map if k.startswith("model.visual."))
     n_mtp = sum(1 for k in weight_map if k.startswith("mtp."))
-    print(f"excluding {n_visual} vision-tower tensors "
+    print(f"{'including' if args.include_vision else 'excluding'} {n_visual} vision-tower tensors "
           f"{'and including' if args.include_mtp else 'and excluding'} {n_mtp} mtp tensors")
     print(f"keeping {len(keep_keys)} tensors for layers [{args.start}, {args.end})"
           f"{' + globals' if args.include_globals else ''}"
-          f"{' + mtp' if args.include_mtp else ''}")
+          f"{' + mtp' if args.include_mtp else ''}"
+          f"{' + vision' if args.include_vision else ''}")
 
     needed_shards = sorted(set(weight_map[k] for k in keep_keys))
     print(f"reading from {len(needed_shards)} shard(s) in batches of {args.shards_per_batch}")
