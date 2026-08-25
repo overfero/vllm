@@ -118,6 +118,28 @@ _DEFAULT_SEND_TIMEOUT_S = 60.0  # `Transport.send()` has no timeout parameter - 
 _NO_TIMEOUT_MS = 2**31 - 1  # `recv(timeout=None)` - the driver needs a real (very large) deadline
 _DRAIN_TIMEOUT_S = 3.0  # close()'s grace period for already-written data to actually be acked
 
+# Real bug hit running this for real (a genuine multi-machine deployment,
+# not loopback): the OS-socket-level keepalive ping above (peer.py's
+# `pack_ping`, sent on the raw, driver-independent fd) keeps the NAT
+# pinhole open for connectivity in general, but it is NOT a real QUIC
+# frame - it never goes through `PyQuicConnectionDriver`, so it does
+# nothing to keep the QUIC connection's OWN internal state (path
+# validation, peer-address tracking) fresh. Confirmed directly: after a
+# real ~75s idle period on an already-connected, already-keepalive-pinged
+# link between two genuinely separate machines, the FIRST real send()
+# after the idle gap hung for the full 60s send timeout on the sender
+# side while the receiver's recv() never returned anything at all - the
+# raw-socket ping alone was not enough to keep the actual QUIC path
+# usable. `_keepalive_loop` below now ALSO sends a tiny sentinel message
+# through the real driver (`self._driver.send()` - the same call `send()`
+# uses for real data), on the same cadence, so real QUIC traffic
+# periodically flows across the connection even when the caller has
+# nothing to send - keeping quinn-proto's own path/ack state active, not
+# just the NAT mapping. `recv()` transparently discards any message
+# matching this sentinel before returning to the caller, so nothing about
+# the public send()/recv() data contract changes.
+_KEEPALIVE_SENTINEL = b"__VLLM_QUIC_TRANSPORT_KEEPALIVE_PING_SENTINEL_V1__"
+
 
 class QUICTransport(Transport):
     def __init__(self) -> None:
@@ -188,7 +210,7 @@ class QUICTransport(Transport):
         # ---- Phase 2: real QUIC handshake, on the now-punched socket/
         # addr, driven entirely by the Rust ConnectionDriver. ----
         max_message_bytes = int(config.quic_max_message_bytes) or DEFAULT_MAX_MESSAGE_BYTES
-        idle_timeout = float(config.quic_idle_timeout) or DEFAULT_IDLE_TIMEOUT_S
+        idle_timeout = float(config.quic_idle_timeout) if config.quic_idle_timeout else DEFAULT_IDLE_TIMEOUT_S
         idle_timeout_ms = max(1, int(idle_timeout * 1000))
 
         # Buffer-aware window sizing, ported byte-for-byte from the old
@@ -263,6 +285,14 @@ class QUICTransport(Transport):
             seq += 1
             with contextlib.suppress(OSError):
                 self._sock.sendto(_hp.pack_ping(seq, time.monotonic()), self._keepalive_addr)
+            # Real QUIC-level traffic too - see _KEEPALIVE_SENTINEL's own
+            # comment for the real idle-connection bug this closes. Best
+            # effort: a concurrent real send() already in flight, or a
+            # connection that's mid-close, can make this raise - never let
+            # a keepalive hiccup kill the thread or surface to the caller.
+            if self._driver is not None:
+                with contextlib.suppress(Exception):
+                    self._driver.send(_KEEPALIVE_SENTINEL, 5000)
 
     def send(self, data: bytes) -> None:
         if self._driver is None:
@@ -277,24 +307,38 @@ class QUICTransport(Transport):
     def recv(self, timeout: float | None = None) -> bytes:
         if self._driver is None:
             raise RuntimeError("recv() called before connect()")
-        timeout_ms = _NO_TIMEOUT_MS if timeout is None else max(1, int(timeout * 1000))
         _t0 = time.monotonic()
-        try:
-            data = self._driver.recv(timeout_ms)
-        except ValueError as exc:
-            # Rust's EngineError::Timeout and EngineError::Closed both
-            # surface as ValueError here (PyO3's to_py_err maps every
-            # EngineError variant the same way) - distinguish by message
-            # so callers can tell "peer is just slow" from "peer is gone"
-            # instead of both silently looking like a plain timeout.
-            if "timed out" in str(exc):
-                raise TimeoutError(f"recv() timed out after {timeout}s") from exc
-            raise ConnectionError(f"QUICTransport connection terminated: {exc}") from exc
-        logger.info(
-            "[TRANSPORT_TIMING] self=%s peer=%s op=recv bytes=%d duration_ms=%.2f",
-            self._self_id, self._peer_id, len(data), (time.monotonic() - _t0) * 1000,
-        )
-        return bytes(data)
+        _deadline = None if timeout is None else _t0 + timeout
+        while True:
+            if _deadline is None:
+                timeout_ms = _NO_TIMEOUT_MS
+            else:
+                remaining = _deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"recv() timed out after {timeout}s")
+                timeout_ms = max(1, int(remaining * 1000))
+            try:
+                data = self._driver.recv(timeout_ms)
+            except ValueError as exc:
+                # Rust's EngineError::Timeout and EngineError::Closed both
+                # surface as ValueError here (PyO3's to_py_err maps every
+                # EngineError variant the same way) - distinguish by message
+                # so callers can tell "peer is just slow" from "peer is gone"
+                # instead of both silently looking like a plain timeout.
+                if "timed out" in str(exc):
+                    raise TimeoutError(f"recv() timed out after {timeout}s") from exc
+                raise ConnectionError(f"QUICTransport connection terminated: {exc}") from exc
+            if bytes(data) == _KEEPALIVE_SENTINEL:
+                # Real QUIC-level keepalive traffic from the peer's own
+                # _keepalive_loop - see _KEEPALIVE_SENTINEL's comment.
+                # Transparent to every real caller: loop for the next
+                # (real) message instead of returning this one.
+                continue
+            logger.info(
+                "[TRANSPORT_TIMING] self=%s peer=%s op=recv bytes=%d duration_ms=%.2f",
+                self._self_id, self._peer_id, len(data), (time.monotonic() - _t0) * 1000,
+            )
+            return bytes(data)
 
     def close(self) -> None:
         self._keepalive_stop.set()

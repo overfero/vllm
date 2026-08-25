@@ -51,9 +51,21 @@ class TransportConfig:
     # backend they were exclusively for - the Rust engine's congestion
     # controller and window sizing aren't caller-configurable the same
     # way (see rust/src/quic_engine/src/congestion.rs).
-    quic_idle_timeout: float = 45.0  # seconds with no traffic before the QUIC
-    # connection itself declares the peer dead (independent of, and a real
-    # improvement over, UDPTransport's total lack of dead-peer detection)
+    quic_idle_timeout: float | None = None  # seconds with no traffic before
+    # the QUIC connection itself declares the peer dead (independent of, and
+    # a real improvement over, UDPTransport's total lack of dead-peer
+    # detection). None (not a hardcoded literal here) so quic_transport.py's
+    # own `config.quic_idle_timeout or DEFAULT_IDLE_TIMEOUT_S` fallback can
+    # actually reach the VLLM_TRANSPORT_QUIC_IDLE_TIMEOUT_S env var - a
+    # nonzero literal default here would always win over that env var,
+    # silently making it unconfigurable. Real bug hit running this for
+    # real: every stage's RPC control channel and PP tensor link across a
+    # genuine multi-machine (NAT'd, real internet RTT) deployment sat idle
+    # for longer than the old 45s hardcoded default between "connected"
+    # and the first actual request/step, so the connection was already
+    # dead by the time real traffic needed to flow - the env var override
+    # was meant to fix exactly this but never took effect because of this
+    # hardcoded default shadowing it.
     quic_max_message_bytes: int = 2 * 1024 * 1024 * 1024  # application-level
     # cap on top of QUIC's own flow control - defense in depth, not relying
     # solely on library defaults for this (see quic_transport.py)
