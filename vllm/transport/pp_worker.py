@@ -93,6 +93,20 @@ class TransportPPWorker(Worker):
 
         pp_rank = int(os.environ[_ENV_PP_RANK])
         pp_world_size = int(os.environ[_ENV_PP_WORLD_SIZE])
+
+        # A genuinely standalone deployment (one machine, no PP peers at
+        # all - e.g. a model small enough to serve without splitting)
+        # has no cross-machine dimension to replace. install_transport_pp_group()
+        # requires at least one real peer transport by design (see this
+        # module's own docstring: it exists ONLY to replace the
+        # cross-machine dimension, never to interfere with the local
+        # one) - calling it here would always raise. vLLM's own local
+        # `_PP` group from super().init_device() above is already
+        # correct and complete for pp_world_size==1, so there's nothing
+        # for this class to do beyond what Worker already did.
+        if pp_world_size <= 1:
+            return
+
         self_name = os.environ[_ENV_SELF_NAME]
         prev_name = os.environ.get(_ENV_PREV_NAME) or None
         next_name = os.environ.get(_ENV_NEXT_NAME) or None
