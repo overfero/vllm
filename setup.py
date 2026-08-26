@@ -322,6 +322,33 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        def target_name(s: str) -> str:
+            return s.removeprefix("vllm.").removeprefix("vllm_flash_attn.")
+
+        # Real, opt-in trim for machines that don't need every kernel this
+        # build normally produces - e.g. Hopper/Blackwell-only kernels
+        # (_vllm_fa3_C, _vllm_fa4_cutedsl_C, _flashkda_C, _deep_gemm_C,
+        # _qutlass_C, fmha_sm100, tml_fa4) are architecturally unusable on
+        # a T4 (SM75) regardless of TORCH_CUDA_ARCH_LIST - this project's
+        # own vLLM CMakeLists.txt/vllm-flash-attn's CMakeLists.txt don't
+        # reliably skip them (a real gap found running this build for
+        # real: FA3 kept compiling for sm90 despite TORCH_CUDA_ARCH_LIST=
+        # 7.5, confirmed via a direct nvcc -gencode inspection), so this
+        # filters at the setup.py level instead. VLLM_BUILD_EXTENSIONS=
+        # <comma-separated bare target names, e.g. "_C_stable_libtorch">
+        # - unset (default) builds everything, today's unchanged behavior.
+        only = os.environ.get("VLLM_BUILD_EXTENSIONS")
+        if only:
+            wanted = {n.strip() for n in only.split(",") if n.strip()}
+            kept = [ext for ext in self.extensions if target_name(ext.name) in wanted]
+            found = {target_name(ext.name) for ext in kept}
+            missing = wanted - found
+            if missing:
+                raise ValueError(
+                    f"VLLM_BUILD_EXTENSIONS names not found among real extensions: {sorted(missing)}"
+                )
+            self.extensions = kept
+
         # Ensure that CMake is present and working
         try:
             subprocess.check_output(["cmake", "--version"])
@@ -333,9 +360,6 @@ class cmake_build_ext(build_ext):
             os.makedirs(self.build_temp)
 
         targets = []
-
-        def target_name(s: str) -> str:
-            return s.removeprefix("vllm.").removeprefix("vllm_flash_attn.")
 
         # Build all the extensions
         for ext in self.extensions:
