@@ -34,15 +34,22 @@
 #   default. `python3-venv` itself may also need installing first.
 # - Trimmed build (default): only compiles kernels this hardware can
 #   actually use (_C_stable_libtorch, _moe_C_stable_libtorch,
-#   _vllm_fa2_C, cumem_allocator, spinloop, fs_io_C, triton_kernels) -
-#   skips every Hopper/Blackwell-only kernel (_vllm_fa3_C,
-#   _vllm_fa4_cutedsl_C, _flashkda_C, _deep_gemm_C, _qutlass_C,
-#   fmha_sm100, tml_fa4) this project's own vLLM/vllm-flash-attn
-#   CMakeLists.txt don't reliably skip on their own even with
-#   TORCH_CUDA_ARCH_LIST set correctly (confirmed via a real nvcc
-#   -gencode=sm_90 inspection - a real, unresolved upstream gap, not
-#   guessed). Cuts real compile work roughly to a third (~112 of 340
-#   object files, measured directly via ninja's own dependency graph).
+#   cumem_allocator, spinloop, fs_io_C, triton_kernels) - skips every
+#   Hopper/Blackwell-only kernel (_vllm_fa3_C, _vllm_fa4_cutedsl_C,
+#   _flashkda_C, _deep_gemm_C, _qutlass_C, fmha_sm100, tml_fa4) this
+#   project's own vLLM/vllm-flash-attn CMakeLists.txt don't reliably
+#   skip on their own even with TORCH_CUDA_ARCH_LIST set correctly
+#   (confirmed via a real nvcc -gencode=sm_90 inspection - a real,
+#   unresolved upstream gap, not guessed). ALSO skips _vllm_fa2_C -
+#   real finding from an actual inference run: FlashAttention-2 itself
+#   requires compute capability >= 8.0 (Ampere+), so it was NEVER
+#   usable on T4 (SM75/7.5) either, regardless of TORCH_CUDA_ARCH_LIST;
+#   vLLM transparently falls back to its TRITON_ATTN backend and real
+#   inference works fine without it (confirmed: a real Qwen2.5-0.5B-
+#   Instruct serve + completion round-trip, correct answer, on this
+#   exact trimmed build). Cuts real compile work to roughly a third
+#   (~112 of 340 object files with fa2 still included; a bit less
+#   without it - measured directly via ninja's own dependency graph).
 #   Set VLLM_FULL_BUILD=1 to build everything instead (e.g. for
 #   different/newer hardware that actually needs those kernels).
 #
@@ -64,7 +71,7 @@ cd "$REPO_ROOT"
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5}"
 VENV_DIR="${VLLM_BUILD_VENV:-/vllm_build_venv}"
-TRIMMED_TARGETS="_C_stable_libtorch,_moe_C_stable_libtorch,_vllm_fa2_C,cumem_allocator,spinloop,fs_io_C,triton_kernels"
+TRIMMED_TARGETS="_C_stable_libtorch,_moe_C_stable_libtorch,cumem_allocator,spinloop,fs_io_C,triton_kernels"
 
 echo "=== building for TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST ==="
 
@@ -111,7 +118,6 @@ import vllm
 print('vllm OK:', vllm.__file__)
 import vllm._C_stable_libtorch
 import vllm._moe_C_stable_libtorch
-import vllm.vllm_flash_attn._vllm_fa2_C
 print('all core extensions import OK')
 ")
 
