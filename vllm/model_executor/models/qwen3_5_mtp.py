@@ -50,6 +50,29 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _mtp_has_quantized_weights(model_config) -> bool:
+    """Whether the checkpoint's own file index actually has quantized
+    tensors (e.g. a `.qweight` suffix) for any `mtp.*` key.
+
+    Only a local directory can be checked cheaply/synchronously here; for a
+    bare repo id not yet resolved to a local path, fall back to trusting the
+    declared `dynamic` config (return True) rather than guessing.
+    """
+    import json
+    import os
+
+    model_path = model_config.model
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return True
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, json.JSONDecodeError):
+        return True
+    return any("mtp" in k and k.endswith(".qweight") for k in weight_map)
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -106,13 +129,30 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # GPTQ: quantized checkpoints may exclude MTP from quantization via
         # quantization_config.dynamic with "-:pattern" entries. When detected,
         # disable quantization for MTP layers so they use unquantized params.
+        #
+        # The `dynamic` metadata isn't always trustworthy though: some
+        # AutoRound-quantized checkpoints declare "+:.*mtp.*" (implying MTP
+        # was calibrated for quantization) but still ship every MTP tensor
+        # as a plain unquantized `.weight` - no `.qweight`/`.scales`/etc -
+        # in the actual safetensors files (confirmed on a real checkpoint:
+        # Vishva007/Qwen3.8-27B-W4A16-AutoRound-GPTQ - "+:.*mtp.*" present,
+        # zero quantized suffixes among mtp.* keys). Trust what the
+        # checkpoint's own file index actually contains over the declared
+        # dynamic pattern.
         original_quant = vllm_config.quant_config
         if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
+            disable_mtp_quant = False
             hf_qc = getattr(model_config.hf_config, "quantization_config", None)
             if isinstance(hf_qc, dict):
                 dynamic = hf_qc.get("dynamic", {})
                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
-                    vllm_config.quant_config = None
+                    disable_mtp_quant = True
+            if not disable_mtp_quant and not _mtp_has_quantized_weights(
+                model_config
+            ):
+                disable_mtp_quant = True
+            if disable_mtp_quant:
+                vllm_config.quant_config = None
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,

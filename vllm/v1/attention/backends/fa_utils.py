@@ -20,11 +20,33 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        compile_flash_attn_varlen_func_from_specs,
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+
+    # On CUDA archs without the FA2/FA3 CUDA extensions built (e.g. a trimmed
+    # T4/sm_75 build - FA2 requires compute capability >= 8.0 and was never
+    # usable on Turing regardless, so it's skipped from the target list; see
+    # setup_inference_machine.sh), the module-level import below can raise.
+    # Turing's own attention path uses the TRITON_ATTN backend and never
+    # calls into these, so defer the failure to call time instead of import
+    # time - same lazy-stub pattern already used for the ROCm branch below.
+    try:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            compile_flash_attn_varlen_func_from_specs,
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+    except ImportError:
+
+        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
+            raise ImportError(
+                "vllm.vllm_flash_attn requires the CUDA flash attention "
+                "extensions (_vllm_fa2_C or _vllm_fa3_C), which are not "
+                "built in this install."
+            )
+
+        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+            return None
+
+        compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
